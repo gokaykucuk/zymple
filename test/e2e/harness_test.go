@@ -361,6 +361,8 @@ func (a app) webContainers(t *testing.T) []string {
 type load struct {
 	total, failed atomic.Int64
 	firstFailure  atomic.Value
+	mu            sync.Mutex
+	failures      []string
 	stop          context.CancelFunc
 	done          sync.WaitGroup
 }
@@ -381,12 +383,25 @@ func (a app) startLoad() *load {
 				if err != nil || code != 200 {
 					l.failed.Add(1)
 					l.firstFailure.CompareAndSwap(nil, fmt.Sprintf("status %d, error %v", code, err))
+					l.mu.Lock()
+					if len(l.failures) < 50 {
+						l.failures = append(l.failures, fmt.Sprintf("%s status %d, error %v",
+							time.Now().UTC().Format("15:04:05.000"), code, err))
+					}
+					l.mu.Unlock()
 				}
 				time.Sleep(2 * time.Millisecond)
 			}
 		}()
 	}
 	return l
+}
+
+// failureLog lists the recorded failures with their times.
+func (l *load) failureLog() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.failures, "\n")
 }
 
 func (l *load) finish(t *testing.T) {

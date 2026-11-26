@@ -59,6 +59,15 @@ is a test failure. Covered: a successful deploy, a rollback, a redeploy, a
 reload, a deploy that fails its health check, both crash-recovery cases, and
 an aggressive image prune followed by a reload.
 
+The stress workflow (`.github/workflows/stress.yml`, run by hand or by
+pushing a `stress/` branch) repeats the switch 40 times on each of six
+runners while two load generators run: one outside the host, and one inside
+it that opens a new connection per request. Each failure is logged with its
+time, so it can be matched to a phase of a deploy. This is how the dropped
+connections caused by reloading Caddy were found and how the fix was proven.
+It is too slow for every push; run it after any change to how traffic is
+switched.
+
 ### Authentication and isolation
 
 - A matrix of token against route, in unit tests and end to end: no token, a
