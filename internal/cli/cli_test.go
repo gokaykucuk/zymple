@@ -436,9 +436,9 @@ func TestPrintableKeepsColoursAndNothingElse(t *testing.T) {
 		}
 	}
 	var out bytes.Buffer
-	print := printer(Env{Stdout: &out})
-	print(deploy.Event{Step: "start", Status: "log", Message: "a\x1b[2Kb"})
-	print(deploy.Event{Step: "health", Status: "fail", Message: "x\x1b[1A"})
+	show := printer(Env{Stdout: &out})
+	show(deploy.Event{Step: "start", Status: "log", Message: "a\x1b[2Kb"})
+	show(deploy.Event{Step: "health", Status: "fail", Message: "x\x1b[1A"})
 	if strings.Contains(out.String(), "\x1b") {
 		t.Errorf("an escape sequence reached the terminal: %q", out.String())
 	}
