@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gokaykucuk/zymple/internal/appdef"
 	"github.com/gokaykucuk/zymple/internal/auth"
@@ -193,13 +195,42 @@ func printer(env Env) func(deploy.Event) {
 	return func(e deploy.Event) {
 		switch {
 		case e.Status == "log" || e.Step == "done":
-			fmt.Fprintln(env.Stdout, e.Message)
+			fmt.Fprintln(env.Stdout, printable(e.Message))
 		case e.Status == "start":
-			fmt.Fprintf(env.Stdout, "==> %s\n", e.Step)
+			fmt.Fprintf(env.Stdout, "==> %s\n", printable(e.Step))
 		case e.Status == "fail":
-			fmt.Fprintf(env.Stdout, "==> %s failed: %s\n", e.Step, e.Message)
+			fmt.Fprintf(env.Stdout, "==> %s failed: %s\n", printable(e.Step), printable(e.Message))
 		}
 	}
+}
+
+// colourRe matches the terminal sequences that only change colour and style.
+var colourRe = regexp.MustCompile(`\x1b\[[0-9;]{0,32}m`)
+
+// printable makes text from the server safe to print. Most of it is output
+// of the app's own containers, which whoever builds the image controls, and
+// it is printed on an operator's terminal or into a CI log. Colours are
+// and line breaks are kept; every other control character is replaced, so that output cannot
+// move the cursor, rewrite earlier lines, retitle the window or write to the
+// clipboard.
+func printable(s string) string {
+	clean := func(part string) string {
+		return strings.Map(func(r rune) rune {
+			if r == '\t' || r == '\n' || (r >= 0x20 && r != 0x7f && (r < 0x80 || r > 0x9f)) {
+				return r
+			}
+			return utf8.RuneError
+		}, part)
+	}
+	var b strings.Builder
+	last := 0
+	for _, loc := range colourRe.FindAllStringIndex(s, -1) {
+		b.WriteString(clean(s[last:loc[0]]))
+		b.WriteString(s[loc[0]:loc[1]])
+		last = loc[1]
+	}
+	b.WriteString(clean(s[last:]))
+	return b.String()
 }
 
 func adminStream(ctx context.Context, env Env, method, path string, body any) error {

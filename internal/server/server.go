@@ -55,6 +55,10 @@ type Server struct {
 	apps   map[string]*appdef.App
 	tokens map[string]auth.Set
 
+	logMu sync.Mutex
+	// logStreams counts the log streams open for each app.
+	logStreams map[string]int
+
 	// ops tracks operations that outlive their request.
 	ops sync.WaitGroup
 	// base is cancelled when the daemon shuts down.

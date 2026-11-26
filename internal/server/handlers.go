@@ -22,6 +22,8 @@ const (
 	adminActor  = "admin"
 	maxLogTail  = 5000
 	defaultTail = 200
+	// maxLogStreams bounds the log streams open at once for one app.
+	maxLogStreams = 8
 )
 
 type ctxKey int
@@ -306,9 +308,38 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request, app *appdef.
 		service = ""
 	}
 	follow := q.Get("follow") == "true"
+	done, ok := s.logSlot(app.Name)
+	if !ok {
+		w.Header().Set("Retry-After", "5")
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many log streams are open for this app"})
+		return
+	}
+	defer done()
 	s.attached(w, r, func(ctx context.Context, out io.Writer) error {
 		return s.Docker.Logs(ctx, app.Name, role, service, tail, follow, out)
 	})
+}
+
+// logSlot takes one of the app's log stream slots. Every open stream is a
+// `docker logs` process and a backlog of its own, and a token holder can open
+// as many as they like and read none of them, so the number is bounded.
+func (s *Server) logSlot(app string) (release func(), ok bool) {
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+	if s.logStreams[app] >= maxLogStreams {
+		return nil, false
+	}
+	if s.logStreams == nil {
+		s.logStreams = map[string]int{}
+	}
+	s.logStreams[app]++
+	return func() {
+		s.logMu.Lock()
+		defer s.logMu.Unlock()
+		if s.logStreams[app]--; s.logStreams[app] <= 0 {
+			delete(s.logStreams, app)
+		}
+	}, true
 }
 
 func (s *Server) handleApps(w http.ResponseWriter, _ *http.Request) {

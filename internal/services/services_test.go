@@ -481,6 +481,9 @@ func TestRestoreIntoDrill(t *testing.T) {
 		if strings.HasSuffix(c.String(), " check") {
 			return "", errors.New("cluster is down"), true
 		}
+		if c.Args[0] == "inspect" && strings.HasSuffix(c.String(), "-drill-drill1") {
+			return "shop postgres-drill", nil, true
+		}
 		return "", nil, false
 	})
 	p := newPostgres(t, "posix", fake)
@@ -554,6 +557,50 @@ func TestRestoreFailures(t *testing.T) {
 	fake.Handler = func(execx.Cmd) (string, error) { return "", errors.New("injected") }
 	if err := newPostgres(t, "posix", fake).RemoveDrill(ctx, "shop", "d"); err == nil {
 		t.Error("a failing drill removal was not reported")
+	}
+}
+
+// Regression: a drill was removed by container name alone, and the drill
+// "postgres" of app "shop" has the same name as the live database of an app
+// called "shop-postgres-drill".
+func TestRemoveDrillOnlyRemovesItsOwnDrill(t *testing.T) {
+	if DrillContainer("shop", "postgres") != PostgresContainer("shop-postgres-drill") {
+		t.Fatal("the names no longer collide; this test needs another example")
+	}
+	for name, c := range map[string]struct {
+		labels  string
+		err     error
+		removed bool
+		fails   bool
+	}{
+		"its own drill":              {labels: "shop postgres-drill", removed: true},
+		"another app's database":     {labels: "shop-postgres-drill postgres", fails: true},
+		"another app's drill":        {labels: "other postgres-drill", fails: true},
+		"a container without labels": {labels: "", fails: true},
+		"no container":               {err: errors.New("Error: No such object: zymple-shop-postgres-drill-postgres")},
+		"docker is down":             {err: errors.New("cannot connect to the Docker daemon"), fails: true},
+	} {
+		fake := &execxtest.Fake{Handler: func(cmd execx.Cmd) (string, error) {
+			if cmd.Args[0] == "inspect" {
+				return c.labels, c.err
+			}
+			return "", nil
+		}}
+		p := newPostgres(t, "posix", fake)
+		data := filepath.Join(p.dir("shop"), "drill-postgres")
+		if err := os.MkdirAll(data, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		err := p.RemoveDrill(ctx, "shop", "postgres")
+		if (err != nil) != c.fails {
+			t.Errorf("%s: error = %v, want failure %v", name, err, c.fails)
+		}
+		if removed := fake.Count("rm -f") > 0; removed != c.removed {
+			t.Errorf("%s: container removed = %v, want %v", name, removed, c.removed)
+		}
+		if _, statErr := os.Stat(data); c.fails == errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("%s: drill data present = %v after error %v", name, statErr == nil, err)
+		}
 	}
 }
 

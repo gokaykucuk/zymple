@@ -357,3 +357,32 @@ func TestManifestLookupDoesNotReadLayers(t *testing.T) {
 		t.Errorf("HEAD manifests/<layer digest>: %d, want 404", resp.StatusCode)
 	}
 }
+
+// Regression: the guard allowed everything under blobs/uploads/, and the
+// registry reads "/v2/zymple/shop/blobs/uploads/x/manifests/t" as a manifest
+// of repository "zymple/shop/blobs/uploads/x". A token could create images
+// outside its app's repository, where cleanup never looks.
+func TestTokenCannotPushToANestedRepository(t *testing.T) {
+	f := newRegistry(t)
+	config, layer := []byte(`{"architecture":"amd64","os":"linux"}`), []byte("a layer")
+	nested := "/v2/zymple/shop/blobs/uploads/x"
+	for name, c := range map[string][2]string{
+		"start an upload":  {"POST", nested + "/blobs/uploads/"},
+		"probe a blob":     {"HEAD", nested + "/blobs/" + digest.FromBytes(layer).String()},
+		"put a manifest":   {"PUT", nested + "/manifests/evil"},
+		"probe a manifest": {"HEAD", nested + "/manifests/evil"},
+	} {
+		resp := f.do("shop", c[0], c[1], ociManifest(config, layer), v1.MediaTypeImageManifest)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: %s %s = %d, want 403", name, c[0], c[1], resp.StatusCode)
+		}
+	}
+	ctx := namespaces.WithNamespace(context.Background(), testNamespace)
+	list, err := f.stores.ImageService().List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, img := range list {
+		t.Errorf("an image was created: %s", img.Name)
+	}
+}
