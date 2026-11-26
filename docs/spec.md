@@ -123,6 +123,12 @@ postgres: { version: 17, pitr_days: 14 }
 redis: { persistent: false }
 ```
 
+`postgres` and `redis` each take an optional `env`: the name of the variable
+their connection URL is injected as. The defaults are `DATABASE_URL` and
+`REDIS_URL`. An app that reads its own names sets them here, for example
+`postgres: { version: 17, env: SHOP_DATABASE_URL }`, since the compose file
+cannot rename variables.
+
 Unknown keys are an error. A definition that fails validation is reported by
 `zymple reload` and ignored; the previously loaded app keeps running on its
 last good definition and other apps are unaffected. Its tokens file is still
@@ -161,7 +167,8 @@ rejected.
 - Mapping keys must be strings.
 - `$` is not allowed anywhere else, which disables compose interpolation.
 - YAML anchors, aliases and merge keys are refused.
-- `DATABASE_URL` and `REDIS_URL` may not be set by the app.
+- `DATABASE_URL`, `REDIS_URL` and any names chosen with `env` may not be set
+  by the app.
 
 For each release Zymple renders the file it actually runs: the image pinned
 by digest, `pull_policy: never`, `no-new-privileges`, the env file, labels,
@@ -304,6 +311,11 @@ message. Do not run `prune -a` on a Zymple host; Zymple prunes its own images.
   with its own generated password that no app is given. Only trusted
   extensions can be created from the app; for anything else use
   `docker exec -it zymple-<app>-postgres psql -U postgres app`.
+- `postgres: { create_roles: true }` lets the app's role create other roles,
+  for apps whose migrations separate privileges that way. It is never a
+  superuser. The setting needs Postgres 16 or newer: before that, a role with
+  CREATEROLE could grant itself the predefined roles that read files and run
+  programs on the server. Removing the setting takes the privilege away.
 - Both passwords are generated on first use (`password` and `admin-password`
   in the app's `postgres/` state directory). The roles and the app's password
   are re-applied at every container start and once after each start of the

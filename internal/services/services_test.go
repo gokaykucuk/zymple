@@ -1385,3 +1385,48 @@ func TestRoleSetupWaitsForRecoveryToEnd(t *testing.T) {
 		t.Errorf("cancelled wait: %v", err)
 	}
 }
+
+func TestPostgresCreateRolesIsAppliedBothWays(t *testing.T) {
+	st := &dockerState{}
+	fake := &execxtest.Fake{}
+	rec := &capture{}
+	fake.Handler = rec.wrap(st.handler(nil))
+	p := newPostgres(t, "", fake)
+
+	plain := testApp(t, "postgres: { version: 18 }\n")
+	if _, err := p.Ensure(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	if sql := rec.sql(); !strings.Contains(sql, "ALTER ROLE app NOCREATEROLE;") || strings.Contains(sql, "ALTER ROLE app CREATEROLE;") {
+		t.Fatalf("an app that did not ask for it must not get CREATEROLE:\n%s", sql)
+	}
+	if strings.Contains(rec.sql(), "ALTER ROLE app SUPERUSER") {
+		t.Fatal("the app's role was made a superuser")
+	}
+
+	// Turning the setting on recreates the container, so the grant is applied.
+	fake.Reset()
+	rec = &capture{}
+	fake.Handler = rec.wrap(st.handler(nil))
+	granted := testApp(t, "postgres: { version: 18, create_roles: true }\n")
+	if _, err := p.Ensure(ctx, granted); err != nil {
+		t.Fatal(err)
+	}
+	if fake.Find("docker run -d") == "" {
+		t.Fatalf("changing create_roles did not recreate the container: %v", fake.Calls())
+	}
+	if sql := rec.sql(); !strings.Contains(sql, "ALTER ROLE app CREATEROLE;") || strings.Contains(sql, "SUPERUSER LOGIN PASSWORD") {
+		t.Fatalf("create_roles did not grant CREATEROLE:\n%s", sql)
+	}
+
+	// Turning it off again takes the privilege away.
+	fake.Reset()
+	rec = &capture{}
+	fake.Handler = rec.wrap(st.handler(nil))
+	if _, err := p.Ensure(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	if sql := rec.sql(); !strings.Contains(sql, "ALTER ROLE app NOCREATEROLE;") {
+		t.Fatalf("removing create_roles did not revoke CREATEROLE:\n%s", sql)
+	}
+}

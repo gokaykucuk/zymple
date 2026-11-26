@@ -666,6 +666,7 @@ func TestRedisRoutes(t *testing.T) {
 func TestServiceEnv(t *testing.T) {
 	f := newFixture(t, false)
 	writeApp(t, f.appsDir, "full", "postgres: { version: 17 }\nredis: { persistent: false }\n")
+	writeApp(t, f.appsDir, "named", "postgres: { version: 17, env: NAMED_DATABASE_URL }\nredis: { persistent: false, env: NAMED_CACHE_URL }\n")
 	if _, err := f.load(); err != nil {
 		t.Fatal(err)
 	}
@@ -673,6 +674,12 @@ func TestServiceEnv(t *testing.T) {
 	env, err := f.ServiceEnv(context.Background(), app)
 	if err != nil || !strings.HasPrefix(env["DATABASE_URL"], "postgres://app:") || env["REDIS_URL"] != services.RedisURL {
 		t.Fatalf("env = %v, %v", env, err)
+	}
+	// An app that names the variables itself gets them under those names only.
+	named, _ := f.App("named")
+	env, err = f.ServiceEnv(context.Background(), named)
+	if err != nil || len(env) != 2 || !strings.HasPrefix(env["NAMED_DATABASE_URL"], "postgres://app:") || env["NAMED_CACHE_URL"] != services.RedisURL {
+		t.Fatalf("named env = %v, %v", env, err)
 	}
 	f.sim.failOn = "zymple-full-redis"
 	if _, err := f.ServiceEnv(context.Background(), app); err == nil || !strings.Contains(err.Error(), "redis") {

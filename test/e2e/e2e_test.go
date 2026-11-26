@@ -336,9 +336,13 @@ func TestEnvFileAndRedeploy(t *testing.T) {
 func TestPostgresPointInTimeRecovery(t *testing.T) {
 	a := newApp(t, "ledger", appOptions{postgres: true})
 	a.deploy(t, "v1")
-	url := mustHost(t, "zymple", "run", a.name, "--", "printenv", "DATABASE_URL")
+	// The app asked for its own variable name; the default must not be set.
+	url := mustHost(t, "zymple", "run", a.name, "--", "printenv", "LEDGER_DATABASE_URL")
 	if !strings.HasPrefix(url, "postgres://app:") || !strings.Contains(url, "@postgres:5432/app") {
-		t.Fatalf("DATABASE_URL = %q", url)
+		t.Fatalf("LEDGER_DATABASE_URL = %q", url)
+	}
+	if out, err := hostOutput("zymple", "run", a.name, "--", "printenv", "DATABASE_URL"); err == nil {
+		t.Errorf("DATABASE_URL is set although the app renamed it: %q", out)
 	}
 	pg := "zymple-" + a.name + "-postgres"
 	sql := func(container, query string) string {
@@ -347,6 +351,14 @@ func TestPostgresPointInTimeRecovery(t *testing.T) {
 	}
 	notes := func(container string) string {
 		return sql(container, "select coalesce(string_agg(note, ',' order by id), '') from t")
+	}
+
+	// The app asked to create roles: it can, and it is still not a superuser.
+	if got := sql(pg, "create role ledger_auditor nologin; select rolcreaterole::text || rolsuper::text from pg_roles where rolname = current_user"); got != "truefalse" {
+		t.Fatalf("createrole/superuser of the app's role = %q, want truefalse", got)
+	}
+	if out, err := hostOutput("docker", "exec", pg, "psql", "-U", "app", "-d", "app", "-qAt", "-c", "copy (select 1) to program 'true'"); err == nil {
+		t.Fatalf("the app's role can run programs on the database server: %s", out)
 	}
 
 	sql(pg, "create table t(id int primary key, note text)")

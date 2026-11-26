@@ -219,7 +219,13 @@ func (p *Postgres) Ensure(ctx context.Context, app *appdef.App) (string, error) 
 		conf = p.pgbackrestConf(app)
 	}
 	server := p.serverArgs(app, archive)
-	want := configHash(image, strings.Join(server, "\x00"), conf)
+	parts := []string{image, strings.Join(server, "\x00"), conf}
+	if app.Postgres.CreateRoles {
+		// Only added when set, so clusters without it keep their hash and
+		// are not restarted by an upgrade.
+		parts = append(parts, "create_roles")
+	}
+	want := configHash(parts...)
 
 	state, have := inspect(ctx, p.Runner, name)
 	if state == "running" && have == want {
@@ -302,7 +308,7 @@ func (p *Postgres) afterStart(ctx context.Context, app *appdef.App, name, pw str
 	if err := p.waitWritable(ctx, name); err != nil {
 		return err
 	}
-	if err := p.ensureRoles(ctx, app.Name, name, pw); err != nil {
+	if err := p.ensureRoles(ctx, app.Name, name, pw, app.Postgres.CreateRoles); err != nil {
 		return err
 	}
 	if p.backupsEnabled() {
@@ -336,7 +342,11 @@ END $do$;
 // role, which owns the app's database and has the generated password. The
 // password is re-applied at every start, so it survives a restore from
 // another host. Every statement is safe to repeat.
-func (p *Postgres) ensureRoles(ctx context.Context, app, name, pw string) error {
+//
+// createRoles decides whether the app's role may create other roles. It is
+// applied in both directions, so removing the setting takes the privilege
+// away again.
+func (p *Postgres) ensureRoles(ctx context.Context, app, name, pw string, createRoles bool) error {
 	if _, err := p.psql(ctx, name, pgAdmin, adminDatabase, "SELECT 1"); err != nil {
 		// Clusters created before Zymple separated the two roles were
 		// initialised with the app's role as their only superuser.
@@ -350,9 +360,10 @@ func (p *Postgres) ensureRoles(ctx context.Context, app, name, pw string) error 
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '%[1]s') THEN CREATE ROLE %[1]s LOGIN; END IF;
 END $do$;
 ALTER ROLE %[1]s LOGIN PASSWORD '%[2]s';
+ALTER ROLE %[1]s %[4]s;
 ALTER DATABASE %[3]s OWNER TO %[1]s;
 SELECT rolsuper FROM pg_roles WHERE rolname = '%[1]s';
-`, pgUser, pw, pgDatabase)
+`, pgUser, pw, pgDatabase, map[bool]string{true: "CREATEROLE", false: "NOCREATEROLE"}[createRoles])
 	super, err := p.psql(ctx, name, pgAdmin, adminDatabase, sql)
 	if err != nil {
 		return err

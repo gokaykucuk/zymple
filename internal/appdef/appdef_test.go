@@ -607,3 +607,78 @@ func FuzzParse(f *testing.F) {
 		}
 	})
 }
+
+func TestServiceEnvNames(t *testing.T) {
+	compose := "services:\n  web:\n    image: ${IMAGE}\n"
+	base := "name: shop\ndomains: [shop.example.com]\nweb: { service: web, port: 80 }\n"
+	parse := func(extra, composeYAML string) (*App, error) {
+		return Parse([]byte(base+extra), []byte(composeYAML))
+	}
+
+	app, err := parse("postgres: { version: 17 }\nredis: { persistent: false }\n", compose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Postgres.Env != "DATABASE_URL" || app.Redis.Env != "REDIS_URL" {
+		t.Fatalf("default names = %q, %q", app.Postgres.Env, app.Redis.Env)
+	}
+	if got := app.InjectedEnv(); len(got) != 2 {
+		t.Fatalf("InjectedEnv = %v", got)
+	}
+
+	app, err = parse("postgres: { version: 17, env: SHOP_DATABASE_URL }\nredis: { persistent: false, env: SHOP_CACHE_URL }\n", compose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := app.InjectedEnv(); len(got) != 2 || got[0] != "SHOP_DATABASE_URL" || got[1] != "SHOP_CACHE_URL" {
+		t.Fatalf("InjectedEnv = %v", got)
+	}
+	if plain, _ := parse("", compose); len(plain.InjectedEnv()) != 0 {
+		t.Error("an app without managed services injects nothing")
+	}
+
+	for name, extra := range map[string]string{
+		"lowercase":        "postgres: { version: 17, env: database_url }\n",
+		"with equals sign": "postgres: { version: 17, env: \"A=B\" }\n",
+		"with a space":     "redis: { env: \"MY URL\" }\n",
+		"leading digit":    "redis: { env: 1URL }\n",
+		"shell syntax":     "redis: { env: \"$(id)\" }\n",
+		"same for both":    "postgres: { version: 17, env: URL }\nredis: { env: URL }\n",
+	} {
+		if _, err := parse(extra, compose); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+
+	// The app may not set a variable Zymple injects, under any name.
+	custom := "postgres: { version: 17, env: SHOP_DATABASE_URL }\n"
+	for name, c := range map[string]string{
+		"mapping": "services:\n  web:\n    image: ${IMAGE}\n    environment: { SHOP_DATABASE_URL: postgres://elsewhere }\n",
+		"list":    "services:\n  web:\n    image: ${IMAGE}\n  worker:\n    image: ${IMAGE}\n    environment: [\"SHOP_DATABASE_URL=postgres://elsewhere\"]\n",
+	} {
+		if _, err := parse(custom, c); err == nil || !strings.Contains(err.Error(), "set by zymple") {
+			t.Errorf("%s: a compose file overriding the injected variable was accepted: %v", name, err)
+		}
+	}
+}
+
+func TestPostgresCreateRoles(t *testing.T) {
+	compose := "services:\n  web:\n    image: ${IMAGE}\n"
+	base := "name: shop\ndomains: [shop.example.com]\nweb: { service: web, port: 80 }\n"
+	app, err := Parse([]byte(base+"postgres: { version: 18, create_roles: true }\n"), []byte(compose))
+	if err != nil || !app.Postgres.CreateRoles {
+		t.Fatalf("create_roles on Postgres 18: %+v, %v", app, err)
+	}
+	if app, _ := Parse([]byte(base+"postgres: { version: 18 }\n"), []byte(compose)); app.Postgres.CreateRoles {
+		t.Error("create_roles must be off unless asked for")
+	}
+	// Before 16, CREATEROLE can grant itself file and program access.
+	for _, version := range []string{"14", "15"} {
+		if _, err := Parse([]byte(base+"postgres: { version: "+version+", create_roles: true }\n"), []byte(compose)); err == nil {
+			t.Errorf("create_roles accepted on Postgres %s", version)
+		}
+	}
+	if _, err := Parse([]byte(base+"postgres: { version: 16, create_roles: true }\n"), []byte(compose)); err != nil {
+		t.Errorf("create_roles refused on Postgres 16: %v", err)
+	}
+}
