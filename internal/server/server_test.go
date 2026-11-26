@@ -624,9 +624,17 @@ func TestPostgresRoutes(t *testing.T) {
 	if f.fake.Count("docker stop ledger-1") != 0 {
 		t.Error("a drill stopped the live app")
 	}
+	// Removal looks at the container's labels before it trusts the name.
+	inspect := f.sim.inspect
+	f.sim.inspect = "shop postgres"
+	if code, _, _ := call(f.admin, "DELETE", "/admin/apps/ledger/pg/drills/drill", "", ""); code != 400 {
+		t.Errorf("removal of a container that is not this app's drill: %d", code)
+	}
+	f.sim.inspect = "ledger postgres-drill"
 	if code, _, _ := call(f.admin, "DELETE", "/admin/apps/ledger/pg/drills/drill", "", ""); code != 200 {
 		t.Errorf("drill removal: %d", code)
 	}
+	f.sim.inspect = inspect
 	if code, _, _ := call(f.admin, "DELETE", "/admin/apps/ledger/pg/drills/BAD", "", ""); code != 400 {
 		t.Errorf("bad drill name: %d", code)
 	}
