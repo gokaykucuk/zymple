@@ -328,16 +328,31 @@ message. Do not run `prune -a` on a Zymple host; Zymple prunes its own images.
 - One cluster per app, in a container managed by Zymple, with its data under
   `/var/lib/zymple/apps/<app>/postgres/data`.
 - The image is `zymple-postgres:<major>`: the official Postgres image plus
-  pgBackRest (`images/postgres/Dockerfile`). This repository publishes it;
-  `postgres_images` in the server config overrides the reference.
-- pgBackRest runs inside that container and ships base backups and WAL to
-  the configured repository, one stanza per app. Repositories are S3
-  compatible buckets or a host directory.
-- The server schedules backups: full weekly, differential daily. Retention is
-  `pitr_days`.
+  WAL-G, pinned by version and checksum (`images/postgres/Dockerfile`). This
+  repository publishes it; `postgres_images` in the server config overrides
+  the reference.
+- WAL-G runs inside that container and ships base backups and WAL to the
+  configured repository. Repositories are S3 compatible buckets or a host
+  directory. Each app has a prefix of its own, `<path>/<app>/postgres`, so
+  several databases on one host never share backups or retention.
+- A base backup is stored as a few compressed tar archives of about 1 GiB,
+  not as one object per table and index, so its object count does not grow
+  with the schema.
+- With `cipher_pass` set, everything WAL-G stores is encrypted with
+  libsodium. The key is the SHA-256 of the passphrase: to restore without
+  Zymple, give WAL-G `WALG_LIBSODIUM_KEY=$(printf %s "$pass" | sha256sum | cut -d' ' -f1)`
+  and `WALG_LIBSODIUM_KEY_TRANSFORM=hex`.
+- The server schedules backups: full weekly, delta daily. A delta holds the
+  pages changed since the backup before it.
+- After each backup that succeeds, Zymple removes what recovery to any time
+  in the last `pitr_days` no longer needs: everything older than the newest
+  full backup that is at least `pitr_days` old. Changing `pitr_days` does not
+  restart the database.
+- The repository's settings and credentials are in a file only the database
+  container mounts (`WALG_CONFIG_PATH`), never on a command line.
 - A deploy never restarts the Postgres container. It is recreated only when
   its image or settings change. The first deploy or reload after the Zymple
-  server starts repeats the role and backup-stanza setup on the running
+  server starts repeats the role setup on the running
   container, without restarting it, so a setup that was interrupted is
   finished.
 - The app connects as role `app`, which owns database `app` and its `public`
@@ -372,7 +387,7 @@ message. Do not run `prune -a` on a Zymple host; Zymple prunes its own images.
 Operator commands, on the host:
 
 - `zymple pg info <app>`
-- `zymple pg backup <app> [--type full|diff|incr]`
+- `zymple pg backup <app> [--type full|delta]`: delta is the default.
 - `zymple pg restore <app> --yes [--time <ts>]`: in place. Stops the app,
   restores, starts it again, holding the deploy lock throughout.
 - `zymple pg restore <app> --into <name> [--time <ts>]`: a drill cluster
@@ -389,6 +404,17 @@ Operator commands, on the host:
 Before a restore, the latest WAL segment is archived so that any time up to
 now is reachable. A target time later than the last recorded transaction
 makes Postgres refuse to start; omit `--time` to restore to the end.
+
+A restore starts from the newest backup that finished before the target
+time, and is refused, before anything is stopped, when there is none. The
+repository is read from a container of its own, so a restore works when the
+live cluster does not.
+
+A restore in place moves the data directory aside
+(`pgdata.before-restore`), fetches the backup into an empty one, and deletes
+the old one only when the restored cluster is up and writable. If the fetch
+fails the old directory is put back; if the cluster does not come up it is
+left where it is. The host needs room for both for that long.
 
 A major version upgrade is a manual procedure in v1.
 
@@ -572,12 +598,22 @@ Known limits:
   often than the app. Requiring every image on every deploy would make CI
   push or look up digests it has no reason to know.
 
+- **WAL-G, not pgBackRest.** The first version used pgBackRest. On its first
+  real bucket it stored a 5.7 GB database of 887 tables as 7,800 objects,
+  one per relation file, and spent most of a twenty-minute backup uploading
+  the 93 MB of them that were smaller than 100 KB. pgBackRest can bundle
+  small files, but WAL-G's layout does it by default, and the operator
+  already ran WAL-G elsewhere and could read its repositories. The cost is
+  that Zymple does what pgBackRest did itself: it picks the backup for a
+  target time, writes the recovery settings, and decides what retention
+  removes. Each of those is tested.
+
 ## Open items
 
 1. **The registry storage is Zymple's to maintain.** Fixes made upstream in
    unregistry have to be ported by hand.
 2. **S3 repositories are not covered by the end-to-end tests**, which use a
-   directory repository. The generated pgBackRest and restic settings for S3
+   directory repository. The generated WAL-G and restic settings for S3
    are unit-tested only.
 3. **The systemd unit and the Ansible role have not run on a real host.**
    The release workflow's provenance attestation has not run either.

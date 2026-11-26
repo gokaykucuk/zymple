@@ -108,7 +108,7 @@ func (d *dockerSim) handle(c execx.Cmd) (string, error) {
 		return "log line 1\nlog line 2\n", nil
 	case strings.Contains(line, " run --rm --no-deps -T"):
 		return "command output\n", nil
-	case strings.Contains(line, "--output=json info"):
+	case strings.Contains(line, "backup-list --detail --json"):
 		return d.infoJSON, nil
 	}
 	return "", nil
@@ -563,10 +563,10 @@ func TestPostgresRoutes(t *testing.T) {
 		t.Fatal("the deploy did not start Postgres")
 	}
 
-	if got := post("/admin/apps/ledger/pg/backup", `{}`); got.Status != "ok" || f.fake.Find("--type=diff backup") == "" {
+	if got := post("/admin/apps/ledger/pg/backup", `{}`); got.Status != "ok" || f.fake.Find("zymple-ledger-postgres wal-g backup-push") == "" || f.fake.Count("WALG_DELTA_MAX_STEPS=0") != 0 {
 		t.Errorf("default backup: %+v", got)
 	}
-	if got := post("/admin/apps/ledger/pg/backup", `{"type":"full"}`); got.Status != "ok" || f.fake.Find("--type=full backup") == "" {
+	if got := post("/admin/apps/ledger/pg/backup", `{"type":"full"}`); got.Status != "ok" || f.fake.Find("-e WALG_DELTA_MAX_STEPS=0 zymple-ledger-postgres wal-g backup-push") == "" {
 		t.Errorf("full backup: %+v", got)
 	}
 	if got := post("/admin/apps/ledger/pg/backup", `{"type":"everything"}`); got.Status != "fail" {
@@ -582,11 +582,12 @@ func TestPostgresRoutes(t *testing.T) {
 	}
 
 	f.fake.Reset()
+	f.sim.infoJSON = `[{"backup_name":"base_000000010000000000000002","finish_time":"2026-01-01T00:00:00Z"}]`
 	if got := post("/admin/apps/ledger/pg/restore", `{"time":"2026-01-02 15:04:05+00"}`); got.Status != "ok" {
 		t.Fatalf("in-place restore: %+v", got)
 	}
 	calls := strings.Join(f.fake.Calls(), "\n")
-	stopApp, restore, startApp := strings.Index(calls, "docker stop ledger-1"), strings.Index(calls, "--delta restore"), strings.Index(calls, "docker start ledger-1")
+	stopApp, restore, startApp := strings.Index(calls, "docker stop ledger-1"), strings.Index(calls, "--entrypoint sh"), strings.Index(calls, "docker start ledger-1")
 	if stopApp < 0 || !(stopApp < restore && restore < startApp) {
 		t.Errorf("the app must be stopped before and started after the restore:\n%s", calls)
 	}
@@ -603,7 +604,7 @@ func TestPostgresRoutes(t *testing.T) {
 
 	// A failed restore still starts the app again.
 	f.fake.Reset()
-	f.sim.failOn = "--delta restore"
+	f.sim.failOn = "--entrypoint sh"
 	if got := post("/admin/apps/ledger/pg/restore", `{}`); got.Status != "fail" {
 		t.Errorf("failed restore: %+v", got)
 	}
@@ -1075,7 +1076,7 @@ func TestScheduledBackups(t *testing.T) {
 	}
 	ctx := context.Background()
 	f.runDueBackups(ctx)
-	if f.fake.Find("--stanza=ledger --type=full backup") == "" {
+	if f.fake.Find("-e WALG_DELTA_MAX_STEPS=0 zymple-ledger-postgres wal-g backup-push") == "" {
 		t.Errorf("a cluster with no backup did not get a full one: %v", f.fake.Calls())
 	}
 	if f.fake.Find("backup /data") == "" {
@@ -1083,9 +1084,9 @@ func TestScheduledBackups(t *testing.T) {
 	}
 	// Recent backups: nothing to do.
 	f.fake.Reset()
-	f.sim.infoJSON = fmt.Sprintf(`[{"backup":[{"type":"full","timestamp":{"stop":%d}}]}]`, time.Now().Unix())
+	f.sim.infoJSON = fmt.Sprintf(`[{"backup_name":"base_000000010000000000000002","finish_time":%q}]`, time.Now().UTC().Format(time.RFC3339))
 	f.runDueBackups(ctx)
-	if f.fake.Count(" backup") != 0 {
+	if f.fake.Count("backup-push") != 0 || f.fake.Count("backup /data") != 0 {
 		t.Errorf("backups ran although none was due: %v", f.fake.Calls())
 	}
 	// Failures are logged, not fatal.

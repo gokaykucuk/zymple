@@ -1,7 +1,7 @@
 name: Postgres image
 
 # Publishes ghcr.io/<owner>/zymple-postgres:<major>. Rebuilt weekly so that
-# Postgres minor releases and pgBackRest updates arrive without a code change.
+# Postgres minor releases arrive without a code change.
 on:
   push:
     branches: [main]
@@ -36,9 +36,9 @@ jobs:
           arch="$(dpkg --print-architecture)"
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker build --pull --build-arg "PG_MAJOR=$MAJOR" -t "$image:$MAJOR-$arch" images/postgres
-          # The image must contain a working pgBackRest before it is published.
-          docker run --rm --entrypoint pgbackrest "$image:$MAJOR-$arch" version
-          # And the certificate authorities pgBackRest needs to reach a bucket.
+          # The image must contain a working WAL-G before it is published.
+          docker run --rm --entrypoint wal-g "$image:$MAJOR-$arch" --version
+          # And the certificate authorities WAL-G needs to reach a bucket.
           docker run --rm --entrypoint test "$image:$MAJOR-$arch" -s /etc/ssl/certs/ca-certificates.crt
           docker push "$image:$MAJOR-$arch"
 

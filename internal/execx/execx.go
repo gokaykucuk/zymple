@@ -1,5 +1,5 @@
 // Package execx runs external commands behind an interface so that the code
-// which builds docker, caddy and pgbackrest command lines can be tested
+// which builds docker, caddy and backup command lines can be tested
 // without running them.
 package execx
 

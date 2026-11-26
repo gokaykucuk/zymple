@@ -556,7 +556,7 @@ func cmdPG(ctx context.Context, args []string, env Env) error {
 		return adminStream(ctx, env, http.MethodGet, adminApps+app+"/pg/info", nil)
 	case "backup":
 		fs := newFlags("pg backup", env)
-		kind := fs.String("type", "diff", "")
+		kind := fs.String("type", services.BackupDelta, "")
 		pos, err := parse(fs, rest)
 		if err != nil {
 			return err

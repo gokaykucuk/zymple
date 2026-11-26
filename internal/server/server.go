@@ -484,6 +484,12 @@ func (s *Server) backupPostgresIfDue(ctx context.Context, app *appdef.App) {
 	out := &logSink{log: s.Log, app: app.Name}
 	if err := s.Postgres.Backup(ctx, app.Name, kind, out); err != nil {
 		s.Log.Error("scheduled backup failed", "app", app.Name, "type", kind, "error", err)
+		return
+	}
+	// Only after a backup that succeeded: what is removed is what the new
+	// backup made unnecessary.
+	if err := s.Postgres.Prune(ctx, app, out); err != nil {
+		s.Log.Error("removing old backups failed", "app", app.Name, "error", err)
 	}
 }
 

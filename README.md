@@ -14,7 +14,7 @@ zymple deploy myapp --image myapp:1.4.2
   or clean up. Only layers the host lacks are uploaded.
 - **Per-app deploy tokens.** A CI secret can deploy one app and nothing else.
 - **Rollback without a push.** The last few releases stay on the host.
-- **Postgres with pgBackRest.** WAL archiving, scheduled backups, restore to a
+- **Postgres with WAL-G.** WAL archiving, scheduled backups, restore to a
   point in time, and drill restores beside the live database.
 - **App definitions are files.** They live in your infrastructure repo, so a
   host can be rebuilt from git.

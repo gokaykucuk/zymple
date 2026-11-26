@@ -120,6 +120,7 @@ containerd:
 backup:
   type: posix
   path: /var/lib/zymple-backups
+  cipher_pass: e2e-backup-passphrase
 postgres_images:
   17: ` + postgresImage + "\n",
 		"/etc/caddy/Caddyfile": "{\n\tauto_https off\n}\n:80 {\n\treverse_proxy 127.0.0.1:7080\n}\nimport /etc/caddy/zymple/*.caddy\n",
@@ -130,6 +131,11 @@ postgres_images:
 		}
 	}
 	if err := hostRun(nil, "mkdir", "-p", "/etc/zymple/apps", "/etc/caddy/zymple", "/var/lib/zymple"); err != nil {
+		return 1, err
+	}
+	// The config holds the backup passphrase; Zymple refuses to start when
+	// anyone but root can read it.
+	if err := hostRun(nil, "chmod", "600", "/etc/zymple/zymple.yml"); err != nil {
 		return 1, err
 	}
 	if err := startDaemons(); err != nil {

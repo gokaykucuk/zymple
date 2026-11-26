@@ -442,12 +442,15 @@ func (s *Server) handlePGBackup(w http.ResponseWriter, r *http.Request, app *app
 		return
 	}
 	if body.Type == "" {
-		body.Type = "diff"
+		body.Type = services.BackupDelta
 	}
 	s.detached(w, r, func(ctx context.Context, st *stream) error {
 		out := st.writer("backup")
 		defer out.flush()
-		return s.Postgres.Backup(ctx, app.Name, body.Type, out)
+		if err := s.Postgres.Backup(ctx, app.Name, body.Type, out); err != nil {
+			return err
+		}
+		return s.Postgres.Prune(ctx, app, out)
 	})
 }
 
