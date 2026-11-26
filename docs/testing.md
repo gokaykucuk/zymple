@@ -32,7 +32,7 @@ build of Zymple into it, then drives it from outside with the real CLI and
 the real docker client, the way CI would. Nothing in the path is faked: image
 layers travel through Caddy into the embedded registry and into containerd,
 containers are started by docker compose, and Postgres is a real cluster
-archiving to a pgBackRest repository.
+archiving to a WAL-G repository.
 
 Set `ZYMPLE_E2E_KEEP=1` to leave the host running for inspection.
 
@@ -159,7 +159,17 @@ End to end, against a real cluster: rows are written before and after a
 recorded time, the cluster is restored to that time, and exactly the earlier
 rows exist. This runs twice: into a drill cluster while the live one keeps
 serving, and in place. Afterwards the restored cluster accepts writes, takes
-a backup and survives a deploy.
+a delta backup and survives a deploy. The same run checks that a base backup
+is a handful of archives, that nothing in the repository is stored
+unencrypted, that the data directory set aside for the restore is gone
+afterwards, and that a target before the first backup is refused without
+touching the cluster.
+
+Unit tests cover what Zymple decides for WAL-G: which backup a target time
+starts from, in every spelling of a time it accepts; which backup the
+retention period keeps; that a backup name or WAL segment name of any other
+shape is refused before it reaches a command line; and that the recovery
+target reaches the restore script as an argument, never as part of it.
 
 ### Managed services
 
@@ -206,6 +216,9 @@ file which is not an archive leaves the app serving.
   authorities, which a directory repository never needs. The image is now
   checked for them, in the suite and before it is published, but nothing
   yet pushes a backup to an S3 endpoint over TLS.
+- Removing old backups against a real repository. Which backup the
+  retention period keeps is unit-tested over listings; the suite takes too
+  few backups, too close together, for anything to be old enough to remove.
 - Redis backup and restore end to end.
 - Upgrading Zymple from a previous release with apps running.
 - Disk-full behaviour during a push or a deploy.

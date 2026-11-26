@@ -456,8 +456,18 @@ func TestPostgresPointInTimeRecovery(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	sql(pg, "insert into t values (3, 'mistake')")
 
-	if info := mustHost(t, "zymple", "pg", "info", a.name); !strings.Contains(info, "full backup") {
-		t.Errorf("pg info shows no full backup:\n%s", info)
+	if info := mustHost(t, "zymple", "pg", "info", a.name); !strings.Contains(info, "base_0000") {
+		t.Errorf("pg info shows no backup:\n%s", info)
+	}
+	// A base backup is a few tar archives, not one object per table, and
+	// what is stored is encrypted: none of it starts like a zstd stream.
+	repo := "/var/lib/zymple-backups/" + a.name + "/postgres"
+	parts := strings.Fields(mustHost(t, "sh", "-c", "find "+repo+"/basebackups_005 -path '*tar_partitions*' -type f"))
+	if len(parts) == 0 || len(parts) > 10 {
+		t.Errorf("a base backup of a small database is %d objects, want a handful: %v", len(parts), parts)
+	}
+	if magic := mustHost(t, "sh", "-c", "for f in $(find "+repo+" -name '*.zst' -type f); do head -c 4 $f | od -An -tx1 | tr -d ' \n'; echo; done | grep -c 28b52ffd || true"); magic != "0" {
+		t.Errorf("the repository holds %s unencrypted files (they start with the zstd magic)", magic)
 	}
 
 	// A drill restores beside the live cluster, which keeps serving.
@@ -479,11 +489,25 @@ func TestPostgresPointInTimeRecovery(t *testing.T) {
 	if got := notes(pg); got != "before,kept" {
 		t.Errorf("after point-in-time restore the table holds %q, want before,kept", got)
 	}
+	// The data directory from before the restore is kept only until the
+	// restored cluster is up.
+	if out, err := hostOutput("ls", "/var/lib/zymple/apps/"+a.name+"/postgres/data/pgdata.before-restore"); err == nil {
+		t.Errorf("the old data directory was left behind: %s", out)
+	}
+	// A target before the first backup is refused before anything stops.
+	if out, err := hostOutput("zymple", "pg", "restore", a.name, "--time", "2001-01-01 00:00:00+00", "--yes"); err == nil || !strings.Contains(out, "no backup finished before") {
+		t.Errorf("a restore to before the first backup: %v\n%s", err, out)
+	}
+	if got := notes(pg); got != "before,kept" {
+		t.Errorf("the refused restore changed the cluster: %q", got)
+	}
 	a.wantVersion(t, "v1")
 
 	// The restored cluster still accepts writes, archives and deploys.
 	sql(pg, "insert into t values (4, 'after-restore')")
-	mustHost(t, "zymple", "pg", "backup", a.name, "--type", "diff")
+	if out := mustHost(t, "zymple", "pg", "backup", a.name, "--type", "delta"); !strings.Contains(out, "_D_") {
+		t.Errorf("the second backup is not a delta of the first:\n%s", out)
+	}
 	a.deploy(t, "v2")
 	a.wantVersion(t, "v2")
 	if got := notes(pg); got != "before,kept,after-restore" {

@@ -352,7 +352,7 @@ func TestOperatorCommands(t *testing.T) {
 		{[]string{"redeploy", "shop"}, "POST /admin/apps/shop/redeploy", ""},
 		{[]string{"run", "shop", "--", "bin/console", "--verbose"}, "POST /admin/apps/shop/run", `{"command":["bin/console","--verbose"]}`},
 		{[]string{"pg", "info", "shop"}, "GET /admin/apps/shop/pg/info", ""},
-		{[]string{"pg", "backup", "shop"}, "POST /admin/apps/shop/pg/backup", `{"type":"diff"}`},
+		{[]string{"pg", "backup", "shop"}, "POST /admin/apps/shop/pg/backup", `{"type":"delta"}`},
 		{[]string{"pg", "backup", "shop", "--type", "full"}, "POST /admin/apps/shop/pg/backup", `{"type":"full"}`},
 		{[]string{"pg", "restore", "shop", "--into", "drill"}, "POST /admin/apps/shop/pg/restore", `{"into":"drill","time":""}`},
 		{[]string{"pg", "restore", "shop", "--yes", "--time", "2026-01-02 15:04:05+00"}, "POST /admin/apps/shop/pg/restore", `{"into":"","time":"2026-01-02 15:04:05+00"}`},

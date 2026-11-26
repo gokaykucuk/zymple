@@ -7,10 +7,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,15 +23,16 @@ import (
 )
 
 const (
-	labelConfig  = "zymple.config"
-	flagLabel    = "--label"
-	flagUser     = "--user"
-	flagFormat   = "--format"
-	envPGData    = "PGDATA="
-	rolePostgres = "postgres"
-	roleRedis    = "redis"
-	roleDrill    = "postgres-drill"
-	pgUser       = "app"
+	labelConfig    = "zymple.config"
+	flagLabel      = "--label"
+	flagUser       = "--user"
+	flagFormat     = "--format"
+	flagEntrypoint = "--entrypoint"
+	envPGData      = "PGDATA="
+	rolePostgres   = "postgres"
+	roleRedis      = "redis"
+	roleDrill      = "postgres-drill"
+	pgUser         = "app"
 	// pgAdmin is the cluster's superuser. The app's own role is an ordinary
 	// one: a superuser can run programs and read files inside the database
 	// container, which holds the backup repository's credentials.
@@ -43,8 +42,6 @@ const (
 	adminDatabase = "postgres"
 	pgDataMount   = "/var/lib/postgresql/data"
 	pgData        = pgDataMount + "/pgdata"
-	pgRepoMount   = "/var/lib/pgbackrest"
-	pgConfMount   = "/etc/pgbackrest/pgbackrest.conf"
 	fullInterval  = 7 * 24 * time.Hour
 	diffInterval  = 24 * time.Hour
 	readyTimeout  = 10 * time.Minute
@@ -54,6 +51,10 @@ const (
 var (
 	targetTimeRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}(:?\d{2})?)?$`)
 	drillRe      = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,30}$`)
+	// What WAL-G and Postgres name their backups and WAL segments. Both
+	// names end up on command lines and in SQL, so nothing else is accepted.
+	backupNameRe = regexp.MustCompile(`^base_[0-9A-F]{24}(_D_[0-9A-F]{24})?$`)
+	walSegmentRe = regexp.MustCompile(`^[0-9A-F]{24}$`)
 )
 
 // Postgres manages one Postgres cluster per app.
@@ -70,7 +71,7 @@ type Postgres struct {
 	mu sync.Mutex
 	// settled holds the apps whose cluster has been through afterStart in
 	// this process. The container's label only says it was started with the
-	// wanted settings, not that its roles and stanza were set up.
+	// wanted settings, not that its roles were set up.
 	settled map[string]bool
 }
 
@@ -137,52 +138,30 @@ func secretFile(path string) (string, error) {
 	return secret, nil
 }
 
-// pgbackrestConf renders the pgbackrest configuration for an app.
-func (p *Postgres) pgbackrestConf(app *appdef.App) string {
-	b := p.Config.Backup
-	var s strings.Builder
-	s.WriteString("[global]\n")
-	if b.Type == "s3" {
-		fmt.Fprintf(&s, "repo1-type=s3\nrepo1-path=%s\n", filepath.Join("/", b.Path, app.Name, "postgres"))
-		fmt.Fprintf(&s, "repo1-s3-endpoint=%s\nrepo1-s3-bucket=%s\nrepo1-s3-region=%s\n", b.S3.Endpoint, b.S3.Bucket, b.S3.Region)
-		fmt.Fprintf(&s, "repo1-s3-key=%s\nrepo1-s3-key-secret=%s\n", b.S3.AccessKey, b.S3.SecretKey)
-		if b.S3.PathStyle {
-			s.WriteString("repo1-s3-uri-style=path\n")
-		}
-	} else {
-		fmt.Fprintf(&s, "repo1-type=posix\nrepo1-path=%s\n", pgRepoMount)
-	}
-	if b.CipherPass != "" {
-		fmt.Fprintf(&s, "repo1-cipher-type=aes-256-cbc\nrepo1-cipher-pass=%s\n", b.CipherPass)
-	}
-	fmt.Fprintf(&s, "repo1-retention-full-type=time\nrepo1-retention-full=%d\n", app.Postgres.PITRDays)
-	s.WriteString("start-fast=y\nlog-level-console=info\nlog-level-file=off\n\n")
-	fmt.Fprintf(&s, "[%s]\npg1-path=%s\npg1-user=%s\n", app.Name, pgData, pgAdmin)
-	return s.String()
-}
-
 func (p *Postgres) repoDir(app string) string {
 	return filepath.Join(p.Config.Backup.Path, app, "postgres")
 }
 
-// mounts returns the volume flags shared by the server and one-off containers.
+// mounts returns the volume flags shared by the server and one-off
+// containers, and with a backup repository the setting that points WAL-G at
+// its settings file.
 func (p *Postgres) mounts(app, dataDir string) []string {
 	args := []string{"-v", dataDir + ":" + pgDataMount}
 	if p.backupsEnabled() {
-		args = append(args, "-v", filepath.Join(p.dir(app), "pgbackrest.conf")+":"+pgConfMount+":ro")
+		args = append(args, "-v", filepath.Join(p.dir(app), walgConfFile)+":"+walgConfMount+":ro", "-e", envWalgConfig)
 		if p.Config.Backup.Type == "posix" {
-			args = append(args, "-v", p.repoDir(app)+":"+pgRepoMount)
+			args = append(args, "-v", p.repoDir(app)+":"+walgRepoMount)
 		}
 	}
 	return args
 }
 
-func (p *Postgres) serverArgs(app *appdef.App, archive bool) []string {
+func (p *Postgres) serverArgs(archive bool) []string {
 	args := []string{"postgres", "-c", "wal_level=replica"}
 	if archive {
 		return append(args,
 			"-c", "archive_mode=on",
-			"-c", "archive_command=pgbackrest --stanza="+app.Name+" archive-push %p",
+			"-c", "archive_command=wal-g wal-push %p",
 			"-c", "archive_timeout=60")
 	}
 	return append(args, "-c", "archive_mode=off")
@@ -200,7 +179,7 @@ func (p *Postgres) URL(app string) (string, error) {
 // Ensure makes the app's Postgres container run with the wanted image and
 // settings, and returns the connection URL. A running container that already
 // matches is left alone, so a deploy never restarts the database; it only
-// gets the role and stanza setup when this process has not yet seen that
+// gets the role setup when this process has not yet seen that
 // succeed, because the start that created it may have been interrupted.
 func (p *Postgres) Ensure(ctx context.Context, app *appdef.App) (string, error) {
 	name := PostgresContainer(app.Name)
@@ -216,9 +195,9 @@ func (p *Postgres) Ensure(ctx context.Context, app *appdef.App) (string, error) 
 	archive := p.backupsEnabled()
 	conf := ""
 	if archive {
-		conf = p.pgbackrestConf(app)
+		conf = p.walgConf(app)
 	}
-	server := p.serverArgs(app, archive)
+	server := p.serverArgs(archive)
 	parts := []string{image, strings.Join(server, "\x00"), conf}
 	if app.Postgres.CreateRoles {
 		// Only added when set, so clusters without it keep their hash and
@@ -280,26 +259,8 @@ func (p *Postgres) Ensure(ctx context.Context, app *appdef.App) (string, error) 
 	return p.URL(app.Name)
 }
 
-func (p *Postgres) writeConf(ctx context.Context, app *appdef.App, image, conf string) error {
-	if err := releases.WriteFileAtomic(filepath.Join(p.dir(app.Name), "pgbackrest.conf"), []byte(conf), 0o644); err != nil {
-		return err
-	}
-	if p.Config.Backup.Type != "posix" {
-		return nil
-	}
-	repo := p.repoDir(app.Name)
-	if err := os.MkdirAll(repo, 0o750); err != nil {
-		return err
-	}
-	// The repository must belong to the postgres user inside the image.
-	_, err := execx.Output(ctx, p.Runner, "docker", "run", "--rm", flagUser, "root", "--entrypoint", "chown",
-		"-v", repo+":"+pgRepoMount, image, "postgres:postgres", pgRepoMount)
-	return err
-}
-
-// afterStart waits for the server, makes sure its roles are as Zymple wants
-// them, and makes sure the backup stanza exists. Every step is safe to
-// repeat. The app counts as settled only once all of them have succeeded.
+// afterStart waits for the server and makes sure its roles are as Zymple
+// wants them. Every step is safe to repeat. The app counts as settled only once all of them have succeeded.
 func (p *Postgres) afterStart(ctx context.Context, app *appdef.App, name, pw string) error {
 	p.setSettled(app.Name, false)
 	if err := p.waitReady(ctx, name); err != nil {
@@ -310,11 +271,6 @@ func (p *Postgres) afterStart(ctx context.Context, app *appdef.App, name, pw str
 	}
 	if err := p.ensureRoles(ctx, app.Name, name, pw, app.Postgres.CreateRoles); err != nil {
 		return err
-	}
-	if p.backupsEnabled() {
-		if _, err := execx.Output(ctx, p.Runner, "docker", p.backrest(app.Name, "stanza-create")...); err != nil {
-			return err
-		}
 	}
 	p.setSettled(app.Name, true)
 	return nil
@@ -338,7 +294,7 @@ END $do$;
 `, pgUser)
 
 // ensureRoles brings a cluster's roles to the wanted shape, whatever created
-// it: a superuser named postgres for Zymple and pgBackRest, and the app's own
+// it: a superuser named postgres for Zymple and WAL-G, and the app's own
 // role, which owns the app's database and has the generated password. The
 // password is re-applied at every start, so it survives a restore from
 // another host. Every statement is safe to repeat.
@@ -450,74 +406,6 @@ func (p *Postgres) waitWritable(ctx context.Context, name string) error {
 	}
 }
 
-func (p *Postgres) backrest(app string, args ...string) []string {
-	base := []string{"exec", flagUser, "postgres", PostgresContainer(app), "pgbackrest", "--stanza=" + app}
-	return append(base, args...)
-}
-
-// Backup takes a backup of the given type: full, diff or incr.
-func (p *Postgres) Backup(ctx context.Context, app, kind string, out io.Writer) error {
-	if !p.backupsEnabled() {
-		return errors.New("no backup repository is configured")
-	}
-	switch kind {
-	case "full", "diff", "incr":
-	default:
-		return fmt.Errorf("backup type %q must be full, diff or incr", kind)
-	}
-	return execx.Stream(ctx, p.Runner, out, "docker", p.backrest(app, "--type="+kind, "backup")...)
-}
-
-// Info writes pgbackrest's description of the app's backups.
-func (p *Postgres) Info(ctx context.Context, app string, out io.Writer) error {
-	if !p.backupsEnabled() {
-		return errors.New("no backup repository is configured")
-	}
-	return execx.Stream(ctx, p.Runner, out, "docker", p.backrest(app, "info")...)
-}
-
-type backrestInfo []struct {
-	Backup []struct {
-		Type      string `json:"type"`
-		Timestamp struct {
-			Stop int64 `json:"stop"`
-		} `json:"timestamp"`
-	} `json:"backup"`
-}
-
-// DueBackup decides which scheduled backup, if any, the app needs now: a
-// full backup weekly and a differential daily. It returns "" for none.
-func (p *Postgres) DueBackup(ctx context.Context, app string) (string, error) {
-	raw, err := execx.Output(ctx, p.Runner, "docker", p.backrest(app, "--output=json", "info")...)
-	if err != nil {
-		return "", err
-	}
-	var info backrestInfo
-	if err := json.Unmarshal([]byte(raw), &info); err != nil {
-		return "", fmt.Errorf("pgbackrest info: %w", err)
-	}
-	var lastFull, lastAny time.Time
-	for _, stanza := range info {
-		for _, b := range stanza.Backup {
-			stop := time.Unix(b.Timestamp.Stop, 0)
-			if stop.After(lastAny) {
-				lastAny = stop
-			}
-			if b.Type == "full" && stop.After(lastFull) {
-				lastFull = stop
-			}
-		}
-	}
-	now := p.Now()
-	switch {
-	case now.Sub(lastFull) >= fullInterval:
-		return "full", nil
-	case now.Sub(lastAny) >= diffInterval:
-		return "diff", nil
-	}
-	return "", nil
-}
-
 // RestoreOptions selects what to restore and where.
 type RestoreOptions struct {
 	// Time is the recovery target; empty restores to the end of the archive.
@@ -536,88 +424,6 @@ func (o RestoreOptions) Validate() error {
 		return fmt.Errorf("drill name %q must match %s", o.Into, drillRe)
 	}
 	return nil
-}
-
-func (o RestoreOptions) backrestArgs(app string) []string {
-	args := []string{"--stanza=" + app}
-	if o.Time != "" {
-		args = append(args, "--type=time", "--target="+o.Time, "--target-action=promote")
-	}
-	if o.Into != "" {
-		// A drill cluster must never archive into the live repository.
-		return append(args, "--archive-mode=off", "restore")
-	}
-	return append(args, "--delta", "restore")
-}
-
-// DrillContainer is the name of a drill cluster's container.
-func DrillContainer(app, drill string) string { return PostgresContainer(app) + "-drill-" + drill }
-
-// Restore restores the app's cluster from the backup repository. The caller
-// stops the app's own containers first when restoring in place.
-func (p *Postgres) Restore(ctx context.Context, app *appdef.App, opts RestoreOptions, out io.Writer) error {
-	if !p.backupsEnabled() {
-		return errors.New("no backup repository is configured")
-	}
-	if err := opts.Validate(); err != nil {
-		return err
-	}
-	image := p.Config.PostgresImage(app.Postgres.Version)
-	name := PostgresContainer(app.Name)
-	dataDir := filepath.Join(p.dir(app.Name), "data")
-	// Recovery can only reach a time that archived WAL covers. "check"
-	// switches the WAL segment and waits for it to be archived, so everything
-	// up to now is restorable. It fails when the live cluster is down or
-	// broken, which is exactly when a restore is wanted, so that is not fatal.
-	if err := execx.Stream(ctx, p.Runner, out, "docker", p.backrest(app.Name, "check")...); err != nil {
-		fmt.Fprintf(out, "warning: could not archive the latest WAL before restoring: %v\n", err)
-	}
-	if opts.Into != "" {
-		name = DrillContainer(app.Name, opts.Into)
-		dataDir = filepath.Join(p.dir(app.Name), "drill-"+opts.Into)
-		if _, err := os.Stat(dataDir); err == nil {
-			return fmt.Errorf("drill %q already exists; remove it first", opts.Into)
-		}
-		if err := mountPoint(dataDir); err != nil {
-			return err
-		}
-	} else if _, err := execx.Output(ctx, p.Runner, "docker", "stop", "--time", postgresStopSeconds, name); err != nil {
-		return err
-	}
-
-	run := []string{"run", "--rm", flagUser, "root", "--entrypoint", "sh"}
-	run = append(run, p.mounts(app.Name, dataDir)...)
-	// The data directory is created by root on the host; hand it to postgres,
-	// then restore as postgres.
-	script := `set -e; mkdir -p "$PGDATA"; chown -R postgres:postgres ` + pgDataMount + `; chmod 700 "$PGDATA"; exec gosu postgres pgbackrest "$@"`
-	run = append(run, "-e", envPGData+pgData, image, "-c", script, "pgbackrest")
-	run = append(run, opts.backrestArgs(app.Name)...)
-	if err := execx.Stream(ctx, p.Runner, out, "docker", run...); err != nil {
-		return err
-	}
-
-	pw, err := p.password(app.Name)
-	if err != nil {
-		return err
-	}
-	if opts.Into == "" {
-		if _, err := execx.Output(ctx, p.Runner, "docker", "start", name); err != nil {
-			return err
-		}
-		return p.afterStart(ctx, app, name, pw)
-	}
-	args := []string{"run", "-d", "--name", name,
-		"--network", appdef.Network(app.Name), "--network-alias", "postgres-drill-" + opts.Into,
-		flagLabel, appdef.LabelApp + "=" + app.Name, flagLabel, appdef.LabelRole + "=" + roleDrill,
-		"--security-opt", "no-new-privileges:true",
-		"--shm-size", "256m", "-e", envPGData + pgData}
-	args = append(args, p.mounts(app.Name, dataDir)...)
-	args = append(args, image)
-	args = append(args, p.serverArgs(app, false)...)
-	if _, err := execx.Output(ctx, p.Runner, "docker", args...); err != nil {
-		return err
-	}
-	return p.waitReady(ctx, name)
 }
 
 // RemoveDrill deletes a drill cluster and its data.

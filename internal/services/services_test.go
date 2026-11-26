@@ -3,7 +3,11 @@ package services
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -93,6 +97,14 @@ func (c *capture) sql() string {
 	return strings.Join(c.stdin, "\n")
 }
 
+// testBackups is a repository with a full backup and a delta on top of it.
+const (
+	testFull    = "base_000000010000000000000002"
+	testDelta   = "base_000000010000000000000004_D_000000010000000000000002"
+	testBackups = `[{"backup_name":"` + testFull + `","finish_time":"2026-01-01T00:00:00Z"},` +
+		`{"backup_name":"` + testDelta + `","finish_time":"2026-01-02T00:00:00Z"}]`
+)
+
 // dockerState answers `docker inspect` with a container state and hash.
 type dockerState struct {
 	state, hash string
@@ -109,6 +121,9 @@ func (s *dockerState) handler(extra func(execx.Cmd) (string, error, bool)) func(
 		}
 		if strings.Contains(c.String(), "redis-cli CONFIG SET") {
 			return "OK\n", nil
+		}
+		if strings.Contains(c.String(), "backup-list --detail --json") {
+			return testBackups, nil
 		}
 		switch c.Args[0] {
 		case "inspect":
@@ -154,8 +169,8 @@ func TestPostgresEnsureLifecycle(t *testing.T) {
 	for _, want := range []string{
 		"--name zymple-shop-postgres", "--restart unless-stopped", "--network zymple-shop", "--network-alias postgres",
 		"ghcr.io/gokaykucuk/zymple-postgres:17 postgres", "archive_mode=on",
-		"archive_command=pgbackrest --stanza=shop archive-push %p", ":/var/lib/postgresql/data",
-		"pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro", ":/var/lib/pgbackrest",
+		"archive_command=wal-g wal-push %p", ":/var/lib/postgresql/data",
+		"walg.json:/etc/wal-g/walg.json:ro", ":/var/lib/wal-g", "-e WALG_CONFIG_PATH=/etc/wal-g/walg.json",
 		"-e POSTGRES_USER=postgres", "-e POSTGRES_DB=app", "-e POSTGRES_PASSWORD -e",
 	} {
 		if !strings.Contains(run, want) {
@@ -165,20 +180,24 @@ func TestPostgresEnsureLifecycle(t *testing.T) {
 	if strings.Contains(run, "-p ") || strings.Contains(run, "--publish") {
 		t.Error("postgres must not publish a port")
 	}
-	if fake.Find("pg_isready -h 127.0.0.1") == "" || !strings.Contains(rec.sql(), "ALTER ROLE app LOGIN PASSWORD") || fake.Find("stanza-create") == "" {
+	if fake.Find("pg_isready -h 127.0.0.1") == "" || !strings.Contains(rec.sql(), "ALTER ROLE app LOGIN PASSWORD") {
 		t.Errorf("post-start steps missing: %v", fake.Calls())
 	}
 	if fake.Find("--entrypoint chown") == "" {
 		t.Error("the posix repository was not handed to the postgres user")
 	}
-	conf, err := os.ReadFile(filepath.Join(p.dir("shop"), "pgbackrest.conf"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"repo1-type=posix", "repo1-retention-full=9", "repo1-cipher-pass=Secret", "[shop]", "pg1-path=/var/lib/postgresql/data/pgdata", "pg1-user=postgres"} {
-		if !strings.Contains(string(conf), want) {
-			t.Errorf("pgbackrest.conf lacks %q:\n%s", want, conf)
+	conf := readWalgConf(t, p, "shop")
+	for key, want := range map[string]string{
+		"WALG_FILE_PREFIX": "/var/lib/wal-g", "PGUSER": "postgres", "PGHOST": "/var/run/postgresql",
+		"WALG_COMPRESSION_METHOD": "zstd", "WALG_DELTA_MAX_STEPS": "6",
+		"WALG_LIBSODIUM_KEY": CipherKey("Secret"), "WALG_LIBSODIUM_KEY_TRANSFORM": "hex",
+	} {
+		if conf[key] != want {
+			t.Errorf("walg.json %s = %q, want %q", key, conf[key], want)
 		}
+	}
+	if _, s3 := conf["WALG_S3_PREFIX"]; s3 {
+		t.Errorf("a directory repository got S3 settings: %v", conf)
 	}
 	for _, file := range []string{"password", "admin-password"} {
 		info, err := os.Stat(filepath.Join(p.dir("shop"), file))
@@ -204,9 +223,16 @@ func TestPostgresEnsureLifecycle(t *testing.T) {
 		t.Errorf("unchanged Ensure ran: %v", fake.Calls())
 	}
 
+	// The retention period is applied by Zymple when it removes old backups,
+	// not by the server, so changing it does not restart the database.
+	fake.Reset()
+	if _, err := p.Ensure(ctx, testApp(t, "postgres: { version: 17, pitr_days: 30 }\n")); err != nil || len(fake.Calls()) != 1 {
+		t.Errorf("a changed retention period touched the container: %v, %v", err, fake.Calls())
+	}
+
 	// A changed setting recreates the container and keeps the password.
 	fake.Reset()
-	changed := testApp(t, "postgres: { version: 17, pitr_days: 30 }\n")
+	changed := testApp(t, "postgres: { version: 17, pitr_days: 9, create_roles: true }\n")
 	url3, err := p.Ensure(ctx, changed)
 	if err != nil || url3 != url {
 		t.Fatalf("Ensure after a change: %q, %v", url3, err)
@@ -243,11 +269,11 @@ func TestPostgresWithoutBackups(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := fake.Find("docker run -d")
-	if !strings.Contains(run, "archive_mode=off") || strings.Contains(run, "pgbackrest") {
+	if !strings.Contains(run, "archive_mode=off") || strings.Contains(run, "wal-g") || strings.Contains(run, "WALG") {
 		t.Errorf("without a repository there must be no archiving:\n%s", run)
 	}
-	if fake.Count("stanza-create") != 0 {
-		t.Error("stanza-create ran without a repository")
+	if _, err := os.Stat(filepath.Join(p.dir("shop"), walgConfFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a WAL-G settings file was written without a repository")
 	}
 	var out bytes.Buffer
 	if err := p.Backup(ctx, "shop", "full", &out); err == nil {
@@ -261,26 +287,66 @@ func TestPostgresWithoutBackups(t *testing.T) {
 	}
 }
 
-func TestPgbackrestConfS3(t *testing.T) {
+// readWalgConf returns the settings file Zymple wrote for an app.
+func readWalgConf(t *testing.T, p *Postgres, app string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(p.dir(app), walgConfFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf := map[string]string{}
+	if err := json.Unmarshal(data, &conf); err != nil {
+		t.Fatalf("walg.json is not a flat JSON object: %v\n%s", err, data)
+	}
+	return conf
+}
+
+func TestWalgConfS3(t *testing.T) {
 	p := newPostgres(t, "s3", &execxtest.Fake{})
-	conf := p.pgbackrestConf(testApp(t, "postgres: { version: 17 }\n"))
-	for _, want := range []string{
-		"repo1-type=s3", "repo1-path=/prod/shop/postgres", "repo1-s3-endpoint=s3.example.com", "repo1-s3-bucket=bkt",
-		"repo1-s3-region=eu", "repo1-s3-key=AK", "repo1-s3-key-secret=SK", "repo1-s3-uri-style=path",
-		"repo1-cipher-type=aes-256-cbc", "repo1-retention-full=14",
+	app := testApp(t, "postgres: { version: 17 }\n")
+	conf := map[string]string{}
+	if err := json.Unmarshal([]byte(p.walgConf(app)), &conf); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"WALG_S3_PREFIX": "s3://bkt/prod/shop/postgres", "AWS_ENDPOINT": "https://s3.example.com", "AWS_REGION": "eu",
+		"AWS_ACCESS_KEY_ID": "AK", "AWS_SECRET_ACCESS_KEY": "SK", "AWS_S3_FORCE_PATH_STYLE": "true",
+		"WALG_LIBSODIUM_KEY_TRANSFORM": "hex",
 	} {
-		if !strings.Contains(conf, want) {
-			t.Errorf("conf lacks %q:\n%s", want, conf)
+		if conf[key] != want {
+			t.Errorf("%s = %q, want %q", key, conf[key], want)
 		}
 	}
-	if got := p.mounts("shop", "/data"); len(got) != 4 {
+	if _, file := conf["WALG_FILE_PREFIX"]; file {
+		t.Errorf("an S3 repository got a directory prefix: %v", conf)
+	}
+	if got := p.mounts("shop", "/data"); len(got) != 6 || strings.Contains(strings.Join(got, " "), walgRepoMount) {
 		t.Errorf("s3 needs no repository mount: %v", got)
+	}
+	// Two apps never share a prefix, and the same settings give the same file.
+	other := testApp(t, "postgres: { version: 17 }\n")
+	other.Name = "ledger"
+	first, again := p.walgConf(app), p.walgConf(app)
+	if strings.Contains(p.walgConf(other), "prod/shop/") || first != again {
+		t.Error("the settings file is not per app, or not stable")
+	}
+}
+
+// The key is what an operator needs to restore without Zymple, so its
+// derivation is fixed.
+func TestCipherKey(t *testing.T) {
+	sum := sha256.Sum256([]byte("Secret"))
+	if got := CipherKey("Secret"); got != hex.EncodeToString(sum[:]) || len(got) != 64 {
+		t.Errorf("CipherKey is not the SHA-256 of the passphrase in hex: %q", got)
+	}
+	if CipherKey("Secret") == CipherKey("secret") {
+		t.Error("different passphrases gave the same key")
 	}
 }
 
 func TestPostgresEnsureFailures(t *testing.T) {
 	app := testApp(t, "postgres: { version: 17 }\n")
-	for _, failOn := range []string{"--entrypoint chown", "run -d", "psql", "stanza-create", "rm -f", "docker stop"} {
+	for _, failOn := range []string{"--entrypoint chown", "run -d", "psql", "rm -f", "docker stop"} {
 		st := &dockerState{state: "running", hash: "stale"}
 		fake := &execxtest.Fake{}
 		fake.Handler = st.handler(func(c execx.Cmd) (string, error, bool) {
@@ -344,38 +410,62 @@ func TestBackupAndInfo(t *testing.T) {
 	fake := &execxtest.Fake{}
 	p := newPostgres(t, "posix", fake)
 	var out bytes.Buffer
-	for _, kind := range []string{"full", "diff", "incr"} {
+	for _, kind := range []string{BackupFull, BackupDelta} {
 		if err := p.Backup(ctx, "shop", kind, &out); err != nil {
 			t.Fatal(err)
 		}
 	}
-	want := "docker exec --user postgres zymple-shop-postgres pgbackrest --stanza=shop --type=diff backup"
-	if fake.Find("--type=diff") != want {
-		t.Errorf("backup command:\n got %s\nwant %s", fake.Find("--type=diff"), want)
+	const push = " zymple-shop-postgres wal-g backup-push /var/lib/postgresql/data/pgdata"
+	calls := fake.Calls()
+	if want := "docker exec --user postgres -e WALG_DELTA_MAX_STEPS=0" + push; calls[0] != want {
+		t.Errorf("full backup:\n got %s\nwant %s", calls[0], want)
 	}
-	if err := p.Backup(ctx, "shop", "full; rm -rf /", &out); err == nil {
-		t.Error("an unknown backup type was accepted")
+	if want := "docker exec --user postgres" + push; calls[1] != want {
+		t.Errorf("delta backup:\n got %s\nwant %s", calls[1], want)
 	}
-	if err := p.Info(ctx, "shop", &out); err != nil || fake.Find("--stanza=shop info") == "" {
+	for _, kind := range []string{"full; rm -rf /", "diff", "incr", ""} {
+		if err := p.Backup(ctx, "shop", kind, &out); err == nil {
+			t.Errorf("backup type %q was accepted", kind)
+		}
+	}
+	if err := p.Info(ctx, "shop", &out); err != nil || fake.Find("wal-g backup-list --pretty --detail") == "" {
 		t.Errorf("Info: %v, %v", err, fake.Calls())
 	}
 }
 
+// backupsJSON renders a WAL-G listing; a name with "_D_" is a delta.
+func backupsJSON(now time.Time, entries ...struct {
+	full bool
+	age  time.Duration
+}) string {
+	var parts []string
+	for i, e := range entries {
+		name := fmt.Sprintf("base_%024X", i+2)
+		if !e.full {
+			name += fmt.Sprintf("_D_%024X", i+1)
+		}
+		parts = append(parts, fmt.Sprintf(`{"backup_name":%q,"finish_time":%q}`, name, now.Add(-e.age).UTC().Format(time.RFC3339Nano)))
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+type backupAge = struct {
+	full bool
+	age  time.Duration
+}
+
 func TestDueBackup(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	at := func(age time.Duration) string { return itoa(now.Add(-age).Unix()) }
-	backup := func(kind string, age time.Duration) string {
-		return `{"type":"` + kind + `","timestamp":{"stop":` + at(age) + `}}`
-	}
+	day := 24 * time.Hour
 	cases := []struct {
 		name, json, want string
 	}{
-		{"no stanza yet", `[]`, "full"},
-		{"no backups", `[{"backup":[]}]`, "full"},
-		{"fresh full", `[{"backup":[` + backup("full", time.Hour) + `]}]`, ""},
-		{"full a day old", `[{"backup":[` + backup("full", 25*time.Hour) + `]}]`, "diff"},
-		{"recent diff", `[{"backup":[` + backup("full", 3*24*time.Hour) + `,` + backup("diff", time.Hour) + `]}]`, ""},
-		{"full a week old", `[{"backup":[` + backup("full", 8*24*time.Hour) + `,` + backup("diff", time.Hour) + `]}]`, "full"},
+		{"empty repository", `[]`, BackupFull},
+		{"no output", ``, BackupFull},
+		{"fresh full", backupsJSON(now, backupAge{true, time.Hour}), ""},
+		{"full a day old", backupsJSON(now, backupAge{true, 25 * time.Hour}), BackupDelta},
+		{"recent delta", backupsJSON(now, backupAge{true, 3 * day}, backupAge{false, time.Hour}), ""},
+		{"full a week old", backupsJSON(now, backupAge{true, 8 * day}, backupAge{false, time.Hour}), BackupFull},
 	}
 	for _, c := range cases {
 		fake := &execxtest.Fake{Handler: func(execx.Cmd) (string, error) { return c.json, nil }}
@@ -386,13 +476,100 @@ func TestDueBackup(t *testing.T) {
 			t.Errorf("%s: DueBackup = %q, %v; want %q", c.name, got, err, c.want)
 		}
 	}
-	fake := &execxtest.Fake{Handler: func(execx.Cmd) (string, error) { return "not json", nil }}
-	if _, err := newPostgres(t, "posix", fake).DueBackup(ctx, "shop"); err == nil {
-		t.Error("unparseable info should be an error")
+	for name, raw := range map[string]string{
+		"not json":            "not json",
+		"a name with a shell": `[{"backup_name":"base_000000010000000000000002; rm -rf /","finish_time":"2026-01-01T00:00:00Z"}]`,
+		"a lower-case name":   `[{"backup_name":"base_00000001000000000000000a","finish_time":"2026-01-01T00:00:00Z"}]`,
+	} {
+		fake := &execxtest.Fake{Handler: func(execx.Cmd) (string, error) { return raw, nil }}
+		if _, err := newPostgres(t, "posix", fake).DueBackup(ctx, "shop"); err == nil {
+			t.Errorf("%s: an unusable listing should be an error", name)
+		}
 	}
-	fake.Handler = func(execx.Cmd) (string, error) { return "", errors.New("down") }
+	fake := &execxtest.Fake{Handler: func(execx.Cmd) (string, error) { return "", errors.New("down") }}
 	if _, err := newPostgres(t, "posix", fake).DueBackup(ctx, "shop"); err == nil {
-		t.Error("a failing info command should be an error")
+		t.Error("a failing listing should be an error")
+	}
+}
+
+func TestPrune(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	day := 24 * time.Hour
+	app := testApp(t, "postgres: { version: 17, pitr_days: 14 }\n")
+	name := func(i int) string { return fmt.Sprintf("base_%024X", i+2) }
+	cases := []struct {
+		name string
+		list []backupAge
+		// want is the index of the backup everything before which goes, -1
+		// for no deletion.
+		want int
+	}{
+		{"nothing old enough", []backupAge{{true, 10 * day}, {false, 9 * day}, {true, 3 * day}}, -1},
+		{"only one old full", []backupAge{{true, 20 * day}, {false, 19 * day}, {true, 13 * day}}, -1},
+		{"two old fulls", []backupAge{{true, 27 * day}, {false, 26 * day}, {true, 20 * day}, {false, 15 * day}, {true, 13 * day}}, 2},
+		{"three old fulls", []backupAge{{true, 34 * day}, {true, 27 * day}, {true, 20 * day}, {true, 13 * day}}, 2},
+		{"old delta is not a target", []backupAge{{true, 13 * day}, {false, 12 * day}}, -1},
+		{"empty", nil, -1},
+	}
+	for _, c := range cases {
+		fake := &execxtest.Fake{Handler: func(execx.Cmd) (string, error) { return backupsJSON(now, c.list...), nil }}
+		p := newPostgres(t, "posix", fake)
+		p.Now = func() time.Time { return now }
+		var out bytes.Buffer
+		if err := p.Prune(ctx, app, &out); err != nil {
+			t.Errorf("%s: %v", c.name, err)
+		}
+		got := fake.Find("wal-g delete")
+		if c.want < 0 {
+			if got != "" {
+				t.Errorf("%s: deleted with %q, want nothing", c.name, got)
+			}
+			continue
+		}
+		if want := "docker exec --user postgres zymple-shop-postgres wal-g delete before " + name(c.want) + " --confirm"; got != want {
+			t.Errorf("%s:\n got %s\nwant %s", c.name, got, want)
+		}
+	}
+	fake := &execxtest.Fake{Handler: func(execx.Cmd) (string, error) { return "", errors.New("down") }}
+	if err := newPostgres(t, "posix", fake).Prune(ctx, app, io.Discard); err == nil {
+		t.Error("a failing listing should be an error")
+	}
+	if err := newPostgres(t, "", &execxtest.Fake{}).Prune(ctx, app, io.Discard); err == nil {
+		t.Error("Prune without a repository should fail")
+	}
+}
+
+func TestBackupForATargetTime(t *testing.T) {
+	list, err := parseBackups(testBackups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for target, want := range map[string]string{
+		"":                              testDelta,
+		"2026-01-03 00:00:00+00":        testDelta,
+		"2026-01-02 00:00:00+00":        testDelta,
+		"2026-01-01 23:59:59.999999+00": testFull,
+		"2026-01-01T12:00:00Z":          testFull,
+		"2026-01-01 12:00:00":           testFull,
+		"2026-01-01 14:00:00+02:00":     testFull,
+		"2026-01-01 14:00:00+0200":      testFull,
+		"2026-01-02 01:00:00+02":        testFull,
+	} {
+		got, err := backupFor(list, target)
+		if err != nil || got != want {
+			t.Errorf("backupFor(%q) = %q, %v; want %q", target, got, err, want)
+		}
+	}
+	if _, err := backupFor(list, "2025-12-31 23:59:59+00"); err == nil || !strings.Contains(err.Error(), "no backup finished before") {
+		t.Errorf("a target before the first backup: %v", err)
+	}
+	if _, err := backupFor(nil, ""); err == nil {
+		t.Error("an empty repository has nothing to restore")
+	}
+	// Whatever order WAL-G lists them in, the newest is last.
+	shuffled, err := parseBackups(`[{"backup_name":"` + testDelta + `","finish_time":"2026-01-02T00:00:00Z"},{"backup_name":"` + testFull + `","finish_time":"2026-01-01T00:00:00Z"}]`)
+	if err != nil || shuffled[1].Name != testDelta {
+		t.Errorf("parseBackups did not sort: %+v, %v", shuffled, err)
 	}
 }
 
@@ -449,18 +626,32 @@ func TestRestoreInPlace(t *testing.T) {
 		t.Fatalf("no call containing %q in %v", sub, calls)
 		return -1
 	}
-	check, stop, restore, start := index("--stanza=shop check"), index("docker stop --time 120 zymple-shop-postgres"), index("--entrypoint sh"), index("docker start zymple-shop-postgres")
-	if !(check < stop && stop < restore && restore < start) {
-		t.Errorf("wrong order: check=%d stop=%d restore=%d start=%d", check, stop, restore, start)
+	list, stop, restore, start := index("--entrypoint wal-g"), index("docker stop --time 120 zymple-shop-postgres"), index("--entrypoint sh"), index("docker start zymple-shop-postgres")
+	if !(list < stop && stop < restore && restore < start) {
+		t.Errorf("wrong order: list=%d stop=%d restore=%d start=%d", list, stop, restore, start)
 	}
+	if !strings.Contains(rec.sql(), "pg_switch_wal()") {
+		t.Error("the newest WAL segment was not archived before the restore")
+	}
+	// The repository is read from a container of its own, as postgres.
+	if want := "docker run --rm --user postgres --entrypoint wal-g"; !strings.HasPrefix(calls[list], want) || !strings.HasSuffix(calls[list], "backup-list --detail --json") {
+		t.Errorf("listing command: %s", calls[list])
+	}
+	// The newest backup that finished before the target, the target itself,
+	// and the mode, as arguments of the script and not as part of it.
 	cmd := calls[restore]
-	for _, want := range []string{"--stanza=shop", "--type=time", "--target=2026-01-02 15:04:05+00", "--target-action=promote", "--delta restore"} {
+	if want := " restore " + testDelta + " 2026-01-02 15:04:05+00 inplace"; !strings.HasSuffix(cmd, want) {
+		t.Errorf("restore command does not end in %q:\n%s", want, cmd)
+	}
+	for _, want := range []string{"--user root", "-e WALG_CONFIG_PATH=/etc/wal-g/walg.json", "-e PGDATA=/var/lib/postgresql/data/pgdata",
+		`wal-g backup-fetch "$PGDATA" "$1"`, "recovery.signal", "restore_command = 'wal-g wal-fetch %f %p'",
+		`recovery_target_time = '$2'`, "recovery_target_action = 'promote'", `mv "$PGDATA" "$old"`} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("restore command lacks %q:\n%s", want, cmd)
 		}
 	}
-	if strings.Contains(cmd, "--archive-mode=off") {
-		t.Error("an in-place restore must keep archiving")
+	if strings.Contains(restoreScript, "2026") || strings.Contains(restoreScript, testDelta) {
+		t.Error("the script itself must not contain caller-supplied values")
 	}
 	if !strings.Contains(rec.sql(), "ALTER ROLE app LOGIN PASSWORD") {
 		t.Error("the role password was not re-applied after the restore")
@@ -476,7 +667,7 @@ func TestRestoreWithoutTimeUsesLatest(t *testing.T) {
 	if err := p.Restore(ctx, testApp(t, "postgres: { version: 17 }\n"), RestoreOptions{}, &out); err != nil {
 		t.Fatal(err)
 	}
-	if cmd := fake.Find("--entrypoint sh"); strings.Contains(cmd, "--type=time") || !strings.Contains(cmd, "--delta restore") {
+	if cmd := fake.Find("--entrypoint sh"); !strings.HasSuffix(cmd, " restore "+testDelta+"  inplace") {
 		t.Errorf("restore command: %s", cmd)
 	}
 }
@@ -484,9 +675,10 @@ func TestRestoreWithoutTimeUsesLatest(t *testing.T) {
 func TestRestoreIntoDrill(t *testing.T) {
 	st := &dockerState{state: "running"}
 	fake := &execxtest.Fake{}
-	// "check" fails here: the live cluster being broken must not stop a drill.
+	// The live cluster being broken must not stop a drill: its WAL cannot
+	// be switched, but the repository can still be read.
 	fake.Handler = st.handler(func(c execx.Cmd) (string, error, bool) {
-		if strings.HasSuffix(c.String(), " check") {
+		if c.Args[0] == "exec" && strings.Contains(c.String(), " psql ") {
 			return "", errors.New("cluster is down"), true
 		}
 		if c.Args[0] == "inspect" && strings.HasSuffix(c.String(), "-drill-drill1") {
@@ -501,12 +693,12 @@ func TestRestoreIntoDrill(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "warning") {
-		t.Errorf("a failed WAL check should be reported as a warning: %q", out.String())
+		t.Errorf("a failed WAL switch should be reported as a warning: %q", out.String())
 	}
 	if fake.Count("docker stop") != 0 || fake.Count("docker start") != 0 {
 		t.Errorf("a drill must not touch the live container: %v", fake.Calls())
 	}
-	if cmd := fake.Find("--entrypoint sh"); !strings.Contains(cmd, "--archive-mode=off restore") || strings.Contains(cmd, "--delta") {
+	if cmd := fake.Find("--entrypoint sh"); !strings.HasSuffix(cmd, " restore "+testDelta+"  drill") || !strings.Contains(cmd, "postgres/drill-drill1:/var/lib/postgresql/data") {
 		t.Errorf("drill restore command: %s", cmd)
 	}
 	run := fake.Find("docker run -d")
@@ -983,7 +1175,7 @@ func TestLegacyClusterGainsASuperuserAndWarns(t *testing.T) {
 // were created left a cluster without the app's role for good.
 func TestEnsureFinishesAnInterruptedSetup(t *testing.T) {
 	app := testApp(t, "postgres: { version: 17 }\n")
-	for _, failOn := range []string{"psql", "stanza-create"} {
+	for _, failOn := range []string{"psql", "pg_isready"} {
 		st := &dockerState{}
 		fake := &execxtest.Fake{}
 		rec := &capture{}
@@ -1016,7 +1208,7 @@ func TestEnsureFinishesAnInterruptedSetup(t *testing.T) {
 			t.Fatalf("%s: Ensure after the failure cleared: %v", failOn, err)
 		}
 		assertContainerUntouched(t, fake)
-		if !strings.Contains(rec.sql(), "ALTER ROLE app LOGIN PASSWORD") || fake.Count("stanza-create") != 1 {
+		if !strings.Contains(rec.sql(), "ALTER ROLE app LOGIN PASSWORD") {
 			t.Errorf("%s: the setup was not run again: %v", failOn, fake.Calls())
 		}
 
@@ -1067,7 +1259,6 @@ func TestEnsureSetsUpARunningClusterOncePerProcess(t *testing.T) {
 		"pg_isready":                    1,
 		"psql -U postgres -d postgres ": 3, // the recovery check, then two for the roles
 		"psql -U postgres -d app ":      1,
-		"stanza-create":                 1,
 	} {
 		if got := fake.Count(sub); got != want {
 			t.Errorf("%q ran %d times, want %d: %v", sub, got, want, fake.Calls())
@@ -1131,26 +1322,21 @@ func FuzzRestoreOptions(f *testing.F) {
 	f.Add("2026-01-02 15:04:05' --pg1-path=/", "../x")
 	f.Add("2026-01-02 15:04:05\n--delta", "-rm")
 	nameRe := regexp.MustCompile(`^[a-z0-9-]+$`)
-	fixed := map[string]bool{
-		"--stanza=shop": true, "--type=time": true, "--target-action=promote": true,
-		"--archive-mode=off": true, "--delta": true, "restore": true,
-	}
 	f.Fuzz(func(t *testing.T, at, into string) {
 		opts := RestoreOptions{Time: at, Into: into}
 		if opts.Validate() != nil {
 			return
 		}
-		for _, arg := range opts.backrestArgs("shop") {
-			if fixed[arg] {
-				continue
-			}
-			// The only argument built from input is the recovery target.
-			value, ok := strings.CutPrefix(arg, "--target=")
-			if !ok || value != at || !targetTimeRe.MatchString(value) {
-				t.Fatalf("unexpected pgbackrest argument %q from %+v", arg, opts)
-			}
-			if strings.ContainsAny(value, "\n\r\t'\"\\$`;") || strings.HasPrefix(value, "-") || strings.HasPrefix(value, " ") {
-				t.Fatalf("recovery target %q is not a plain timestamp", value)
+		// The target is an argument of the restore script, which writes it
+		// between single quotes into postgresql.auto.conf. Nothing in it may
+		// end that quote, start a new setting or act as a flag.
+		if strings.ContainsAny(at, "\n\r\t'\"\\$`;#") || strings.HasPrefix(at, "-") || strings.HasPrefix(at, " ") {
+			t.Fatalf("recovery target %q is not a plain timestamp", at)
+		}
+		// Picking the backup must not panic on anything Validate accepts.
+		if at != "" {
+			if _, err := parseTarget(at); err != nil && !strings.Contains(err.Error(), "must look like") {
+				t.Fatalf("parseTarget(%q): %v", at, err)
 			}
 		}
 		if into == "" {

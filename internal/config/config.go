@@ -174,7 +174,8 @@ func (c *Config) validate() error {
 }
 
 func (b *Backup) validate() error {
-	// These values are written into a pgbackrest ini file, one per line.
+	// These values end up in WAL-G's settings file, restic's environment and
+	// an S3 URL.
 	for name, v := range map[string]string{
 		"backup.path": b.Path, "backup.s3.endpoint": b.S3.Endpoint, "backup.s3.bucket": b.S3.Bucket,
 		"backup.s3.region": b.S3.Region, "backup.s3.access_key": b.S3.AccessKey,

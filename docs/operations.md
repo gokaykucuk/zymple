@@ -155,6 +155,9 @@ Backups run on their own once `backup` is configured. To check them:
 zymple pg info myapp
 ```
 
+The list shows each backup's name and time; a name with `_D_` in it is a
+delta. Take one by hand with `zymple pg backup myapp --type full`.
+
 Rehearse a restore without touching the live database:
 
 ```bash
@@ -173,6 +176,28 @@ zymple pg restore myapp --yes --time "2026-01-02 15:04:05+00"
 ```
 
 Omit `--time` to restore to the latest archived state.
+
+## Upgrading from a release that used pgBackRest
+
+Releases up to v0.1.5 backed up with pgBackRest. From the next release the
+image `zymple-postgres:<major>` contains WAL-G instead, under the same tag,
+and the two cannot read each other's repositories.
+
+1. Upgrade Zymple.
+2. On the host, pull the image: `docker pull ghcr.io/gokaykucuk/zymple-postgres:<major>`.
+   Docker does not replace a tag it already has, and a database container
+   started from the old image would have no `wal-g` to archive with.
+3. Run `zymple reload`. The database container is recreated with the new
+   settings; the app loses its database for the few seconds that takes.
+4. Take a full backup: `zymple pg backup <app> --type full`. Point-in-time
+   recovery starts from this backup; nothing before it is reachable with the
+   new release.
+5. The pgBackRest repository is in the same prefix, in `archive/` and
+   `backup/`, beside WAL-G's `basebackups_005/` and `wal_005/`. Delete those
+   two folders once the first WAL-G backup has been restored into a drill
+   cluster.
+
+`--type diff` and `--type incr` are gone; the types are `full` and `delta`.
 
 ## Upgrading from a release before the hardening changes
 
