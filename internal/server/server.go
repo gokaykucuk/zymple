@@ -46,6 +46,11 @@ type Server struct {
 	// Registry serves /v2/ without authentication; the server guards it.
 	Registry http.Handler
 
+	// reloadMu serialises loading the definitions, so two reloads cannot
+	// interleave and leave the older result in place. Reload holds it while
+	// it converges as well.
+	reloadMu sync.Mutex
+
 	mu     sync.RWMutex
 	apps   map[string]*appdef.App
 	tokens map[string]auth.Set
@@ -142,6 +147,8 @@ func (s *Server) Tokens(app string) (auth.Set, bool) {
 // Reload re-reads the app definitions and converges every app. Definitions
 // that fail validation are reported and leave the running app untouched.
 func (s *Server) Reload(ctx context.Context) error {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
 	removed, loadErr := s.load()
 	return errors.Join(loadErr, s.converge(ctx, removed))
 }
@@ -152,14 +159,21 @@ func (s *Server) Reload(ctx context.Context) error {
 // An app that is already loaded keeps its previous definition when the new
 // one cannot be used: a typo in app.yml must not take a running app down.
 // Only an app whose directory is gone counts as removed.
+//
+// Two apps may claim one domain. The app already in use wins: one that is
+// loaded, or that has a release on record, which is what is left to go by
+// after a restart. The caller holds reloadMu.
 func (s *Server) load() ([]string, error) {
-	loaded, loadErr := appdef.LoadAll(s.Config.AppsDir)
-	if loaded == nil {
-		return nil, loadErr
-	}
 	s.mu.RLock()
 	previous := s.apps
 	s.mu.RUnlock()
+
+	loaded, loadErr := appdef.LoadAllPreferring(s.Config.AppsDir, func(name string) bool {
+		return s.incumbent(previous, name)
+	})
+	if loaded == nil {
+		return nil, loadErr
+	}
 
 	apps, keepErrs := keepPrevious(previous, loaded, s.Config.AppsDir)
 	errs := append([]error{loadErr}, keepErrs...)
@@ -187,6 +201,17 @@ func (s *Server) load() ([]string, error) {
 	return removed, errors.Join(errs...)
 }
 
+// incumbent reports whether an app is already in use: loaded, or with a
+// release serving traffic on record. State that cannot be read counts as in
+// use, because the app behind it may well be running.
+func (s *Server) incumbent(previous map[string]*appdef.App, name string) bool {
+	if _, ok := previous[name]; ok {
+		return true
+	}
+	st, err := s.Store.Load(name)
+	return err != nil || st.Current != 0
+}
+
 // reservePorts marks the ports of recorded releases as in use.
 func (s *Server) reservePorts(apps map[string]*appdef.App) {
 	ports, ok := s.Engine.Ports.(*deploy.PortRange)
@@ -206,7 +231,7 @@ func (s *Server) reservePorts(apps map[string]*appdef.App) {
 
 // keepPrevious merges freshly loaded definitions with the ones already in
 // use. A previously loaded app that is missing from loaded, but whose
-// directory still exists, failed to load and keeps its previous definition.
+// directory is not gone, failed to load and keeps its previous definition.
 // A new definition may then claim a domain that such a kept definition still
 // serves; the definition in use wins, and the new one is put back to its own
 // previous definition, or left out if the app is new.
@@ -215,14 +240,7 @@ func keepPrevious(previous, loaded map[string]*appdef.App, appsDir string) (map[
 	for name, app := range loaded {
 		apps[name] = app
 	}
-	kept := map[string]bool{}
-	for name, old := range previous {
-		if _, ok := apps[name]; !ok && isDir(filepath.Join(appsDir, name)) {
-			apps[name] = old
-			kept[name] = true
-		}
-	}
-	var errs []error
+	kept, errs := keepUnloaded(previous, apps, appsDir)
 	// Each pass moves at least one app from its new definition to its
 	// previous one, and the previous definitions never conflicted with each
 	// other, so this ends.
@@ -270,9 +288,49 @@ func newDefinitionInConflict(apps map[string]*appdef.App, kept map[string]bool) 
 	return "", ""
 }
 
-func isDir(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
+// keepUnloaded puts back the previous definition of every app that did not
+// load and is not gone, and returns their names. A definition that broke is
+// already reported by the loader; a path that is no longer a plain directory
+// is skipped by the loader without a word, so it is reported here.
+func keepUnloaded(previous, apps map[string]*appdef.App, appsDir string) (map[string]bool, []error) {
+	names := make([]string, 0, len(previous))
+	for name := range previous {
+		if _, ok := apps[name]; !ok {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	kept := map[string]bool{}
+	var errs []error
+	for _, name := range names {
+		gone, err := definitionGone(filepath.Join(appsDir, name))
+		if gone {
+			continue
+		}
+		apps[name] = previous[name]
+		kept[name] = true
+		if err != nil {
+			errs = append(errs, fmt.Errorf("app %s: %w; keeping the previous definition", name, err))
+		}
+	}
+	return kept, errs
+}
+
+// definitionGone reports whether an app's directory was removed. Only a path
+// that does not exist counts. A symlink, a file, or a path that cannot be
+// inspected is not a removal: it is returned as an error, so that an app is
+// never stopped, or silently left on an old definition, by accident.
+func definitionGone(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("cannot inspect the app directory: %w", err)
+	case !info.IsDir():
+		return false, fmt.Errorf("%s is not a plain directory", path)
+	}
+	return false, nil
 }
 
 // converge makes the host match the loaded definitions.
@@ -303,7 +361,10 @@ func (s *Server) Run(ctx context.Context) error {
 	// Definitions load before the listeners open, so requests are never
 	// answered from an empty app list. Converging can take minutes when a
 	// database has to start, so it runs behind the listeners.
-	if _, err := s.load(); err != nil {
+	s.reloadMu.Lock()
+	_, err := s.load()
+	s.reloadMu.Unlock()
+	if err != nil {
 		s.Log.Error("some app definitions are invalid", "error", err)
 	}
 

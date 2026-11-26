@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/gokaykucuk/zymple/internal/deploy"
 )
@@ -13,6 +14,9 @@ const (
 	// or gone. Beyond it the oldest are dropped; the outcome always arrives
 	// last, so it is never the one dropped.
 	maxBacklog = 10000
+	// maxBacklogBytes bounds the same backlog by the size of its messages:
+	// ten thousand events of the largest size would be far too much to hold.
+	maxBacklogBytes = 16 << 20
 	// maxLine bounds one log event. Output with no newline is cut into
 	// events of this size instead of growing a buffer without limit.
 	maxLine = 64 << 10
@@ -23,6 +27,8 @@ const (
 type stream struct {
 	mu     sync.Mutex
 	events []deploy.Event
+	// bytes is the total length of the messages in events.
+	bytes int
 	// dropped counts events already delivered and released, so a long
 	// `logs -f` does not keep every line in memory.
 	dropped int
@@ -39,12 +45,37 @@ func (s *stream) add(e deploy.Event) {
 		return
 	}
 	s.events = append(s.events, e)
-	if over := len(s.events) - maxBacklog; over > 0 {
-		s.events = append([]deploy.Event(nil), s.events[over:]...)
-		s.dropped += over
-	}
+	s.bytes += len(e.Message)
+	s.drop(s.excess())
 	close(s.wake)
 	s.wake = make(chan struct{})
+}
+
+// excess returns how many of the oldest events are over the limits. The
+// newest event is never counted, however large it is.
+func (s *stream) excess() int {
+	n := max(len(s.events)-maxBacklog, 0)
+	size := s.bytes
+	for _, e := range s.events[:n] {
+		size -= len(e.Message)
+	}
+	for n < len(s.events)-1 && size > maxBacklogBytes {
+		size -= len(s.events[n].Message)
+		n++
+	}
+	return n
+}
+
+// drop forgets the n oldest events. The caller holds the lock.
+func (s *stream) drop(n int) {
+	if n <= 0 {
+		return
+	}
+	for _, e := range s.events[:n] {
+		s.bytes -= len(e.Message)
+	}
+	s.events = append([]deploy.Event(nil), s.events[n:]...)
+	s.dropped += n
 }
 
 func (s *stream) close() {
@@ -86,10 +117,7 @@ func (s *stream) read(i int) ([]deploy.Event, int, bool, <-chan struct{}) {
 func (s *stream) release(i int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if n := i - s.dropped; n > 0 {
-		s.events = append([]deploy.Event(nil), s.events[n:]...)
-		s.dropped = i
-	}
+	s.drop(min(i-s.dropped, len(s.events)))
 }
 
 // Write lets a stream receive command output as log events.
@@ -111,7 +139,8 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 				break
 			}
 			// No line end within the limit: emit what there is.
-			i, next = maxLine, maxLine
+			i = cutPoint(w.buf, maxLine)
+			next = i
 		}
 		line := string(w.buf[:i])
 		w.buf = w.buf[next:]
@@ -129,6 +158,23 @@ func (w *lineWriter) flush() {
 		w.stream.add(deploy.Event{Step: w.step, Status: "log", Message: string(w.buf)})
 		w.buf = nil
 	}
+}
+
+// cutPoint returns where to cut b, which holds at least limit bytes, so that
+// the cut is at or just before limit and not inside a UTF-8 character.
+// Bytes that are not UTF-8 are cut at limit.
+func cutPoint(b []byte, limit int) int {
+	for back := 1; back < utf8.UTFMax && back < limit; back++ {
+		start := limit - back
+		if !utf8.RuneStart(b[start]) {
+			continue
+		}
+		if utf8.FullRune(b[start:limit]) {
+			return limit
+		}
+		return start
+	}
+	return limit
 }
 
 func indexByte(b []byte, c byte) int {

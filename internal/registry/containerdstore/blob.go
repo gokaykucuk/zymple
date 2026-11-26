@@ -2,6 +2,7 @@ package containerdstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,9 @@ const (
 	// ownerLabelPrefix starts the content label that records which
 	// repositories a blob was pushed to.
 	ownerLabelPrefix = "zymple.io/pushed-to."
+	// manifestLabelPrefix starts the content label that records which
+	// repositories verified a blob as a manifest.
+	manifestLabelPrefix = "zymple.io/manifest-of."
 	// maxInlineBlob bounds what Get reads into memory. It matches the size
 	// the registry accepts for a manifest.
 	maxInlineBlob = 4 << 20
@@ -40,6 +44,11 @@ type blobStore struct {
 
 func ownerLabel(repo string) string { return ownerLabelPrefix + repo }
 
+// manifestLabel marks a blob as a manifest the repository's manifest service
+// verified and stored. Uploading a manifest's bytes as an ordinary blob does
+// not earn it.
+func manifestLabel(repo string) string { return manifestLabelPrefix + repo }
+
 // info describes a blob this repository owns. A blob that exists but was
 // never pushed to the repository is reported as unknown.
 func (b *blobStore) info(ctx context.Context, dgst digest.Digest) (content.Info, error) {
@@ -58,10 +67,25 @@ func (b *blobStore) info(ctx context.Context, dgst digest.Digest) (content.Info,
 
 // claim records that the repository uploaded the blob's bytes.
 func (b *blobStore) claim(ctx context.Context, dgst digest.Digest) error {
-	key := ownerLabel(b.repo)
+	return b.label(ctx, dgst, ownerLabel(b.repo))
+}
+
+// isManifest reports whether the repository verified the blob as a manifest.
+func (b *blobStore) isManifest(ctx context.Context, dgst digest.Digest) (bool, error) {
+	info, err := b.info(ctx, dgst)
+	if errors.Is(err, distribution.ErrBlobUnknown) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.Labels[manifestLabel(b.repo)] != "", nil
+}
+
+func (b *blobStore) label(ctx context.Context, dgst digest.Digest, key string) error {
 	info := content.Info{Digest: dgst, Labels: map[string]string{key: "1"}}
 	if _, err := b.reg.stores.ContentStore().Update(b.reg.ctx(ctx), info, "labels."+key); err != nil {
-		return fmt.Errorf("record owner of blob %s: %w", dgst, err)
+		return fmt.Errorf("label blob %s: %w", dgst, err)
 	}
 	return nil
 }

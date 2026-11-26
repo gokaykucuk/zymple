@@ -34,6 +34,7 @@ type world struct {
 	webs     map[int]bool    // release -> running
 	compose  map[int]bool
 	tags     map[string]string // tag -> digest
+	oneoffs  map[string]int    // one-off container id -> release
 	port     int               // where the proxy points
 	hook     map[string]func()
 	nextPort int
@@ -45,7 +46,8 @@ func newWorld() *world {
 	return &world{
 		fail: map[string]error{}, images: map[string]bool{digestA: true, digestB: true, digestC: true},
 		content: map[string]bool{}, webs: map[int]bool{}, compose: map[int]bool{}, tags: map[string]string{},
-		hook: map[string]func(){}, nextPort: 20000,
+		oneoffs: map[string]int{},
+		hook:    map[string]func(){}, nextPort: 20000,
 	}
 }
 
@@ -204,6 +206,35 @@ func (w *world) Containers(_ context.Context, _, _ string) ([]runtime.Container,
 		list = append(list, runtime.Container{ID: fmt.Sprintf("c%d", n), Release: n, Running: running})
 	}
 	return list, nil
+}
+
+// RemoveOneOffs removes the one-off containers match selects. Containers
+// never lists them, as with the real runtime.
+func (w *world) RemoveOneOffs(_ context.Context, _ string, match func(int) bool) error {
+	if err := w.op("RemoveOneOffs"); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for id, release := range w.oneoffs {
+		if match(release) {
+			delete(w.oneoffs, id)
+		}
+	}
+	return nil
+}
+
+func (w *world) hasOneOff(id string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, ok := w.oneoffs[id]
+	return ok
+}
+
+func (w *world) addOneOff(id string, release int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.oneoffs[id] = release
 }
 
 func (w *world) StartContainers(_ context.Context, ids []string) error {

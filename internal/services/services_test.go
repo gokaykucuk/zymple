@@ -917,6 +917,152 @@ func TestLegacyClusterGainsASuperuserAndWarns(t *testing.T) {
 	}
 }
 
+// Regression: a running container with a matching label was taken as proof
+// that the cluster was set up. A first start interrupted before the roles
+// were created left a cluster without the app's role for good.
+func TestEnsureFinishesAnInterruptedSetup(t *testing.T) {
+	app := testApp(t, "postgres: { version: 17 }\n")
+	for _, failOn := range []string{"psql", "stanza-create"} {
+		st := &dockerState{}
+		fake := &execxtest.Fake{}
+		rec := &capture{}
+		failing := true
+		fake.Handler = rec.wrap(st.handler(func(c execx.Cmd) (string, error, bool) {
+			if failing && strings.Contains(c.String(), failOn) {
+				return "", errors.New("injected"), true
+			}
+			return "", nil, false
+		}))
+		p := newPostgres(t, "posix", fake)
+		if _, err := p.Ensure(ctx, app); err == nil {
+			t.Fatalf("%s: the first Ensure should fail", failOn)
+		}
+		if st.state != "running" || st.hash == "" {
+			t.Fatalf("%s: the container should be left running with its label: %+v", failOn, st)
+		}
+
+		// Still failing: the error is reported and the database is not touched.
+		fake.Reset()
+		if _, err := p.Ensure(ctx, app); err == nil {
+			t.Errorf("%s: a setup that fails again was swallowed", failOn)
+		}
+		assertContainerUntouched(t, fake)
+
+		failing = false
+		fake.Reset()
+		rec.cmds, rec.stdin = nil, nil
+		if _, err := p.Ensure(ctx, app); err != nil {
+			t.Fatalf("%s: Ensure after the failure cleared: %v", failOn, err)
+		}
+		assertContainerUntouched(t, fake)
+		if !strings.Contains(rec.sql(), "ALTER ROLE app LOGIN PASSWORD") || fake.Count("stanza-create") != 1 {
+			t.Errorf("%s: the setup was not run again: %v", failOn, fake.Calls())
+		}
+
+		// Once it has succeeded it is not repeated.
+		fake.Reset()
+		if _, err := p.Ensure(ctx, app); err != nil || len(fake.Calls()) != 1 {
+			t.Errorf("%s: a settled Ensure ran: %v, %v", failOn, err, fake.Calls())
+		}
+	}
+}
+
+func assertContainerUntouched(t *testing.T, fake *execxtest.Fake) {
+	t.Helper()
+	for _, verb := range []string{"docker run", "docker rm", "docker stop", "docker start"} {
+		if fake.Count(verb) != 0 {
+			t.Errorf("a running database was touched by %q: %v", verb, fake.Calls())
+		}
+	}
+}
+
+// Regression: after an upgrade of Zymple the database container is already
+// running with a matching label, so the new process never looked at its
+// roles. A new process sets a running cluster up once, and only once.
+func TestEnsureSetsUpARunningClusterOncePerProcess(t *testing.T) {
+	app := testApp(t, "postgres: { version: 17 }\n")
+	st := &dockerState{}
+	fake := &execxtest.Fake{}
+	fake.Handler = st.handler(nil)
+	old := newPostgres(t, "posix", fake)
+	url, err := old.Ensure(ctx, app)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A new process: the same host state, nothing remembered.
+	p := newPostgres(t, "posix", fake)
+	p.Config = old.Config
+	fake.Reset()
+	for i := 0; i < 2; i++ {
+		got, err := p.Ensure(ctx, app)
+		if err != nil || got != url {
+			t.Fatalf("Ensure %d = %q, %v; want %q", i, got, err, url)
+		}
+	}
+	assertContainerUntouched(t, fake)
+	for sub, want := range map[string]int{
+		"docker inspect":                2 + 1, // one per Ensure, one in waitReady
+		"pg_isready":                    1,
+		"psql -U postgres -d postgres ": 2,
+		"psql -U postgres -d app ":      1,
+		"stanza-create":                 1,
+	} {
+		if got := fake.Count(sub); got != want {
+			t.Errorf("%q ran %d times, want %d: %v", sub, got, want, fake.Calls())
+		}
+	}
+
+	// Another app on the same value is tracked separately.
+	if p.isSettled("other") || !p.isSettled("shop") {
+		t.Error("settled state is not per app")
+	}
+}
+
+// Regression: on Postgres 14 the public schema belongs to the superuser, so
+// the app's ordinary role did not own the schema of its own database.
+func TestPublicSchemaGoesToTheAppRoleBeforePostgres15(t *testing.T) {
+	app := testApp(t, "postgres: { version: 17 }\n")
+	st := &dockerState{}
+	fake := &execxtest.Fake{}
+	rec := &capture{}
+	fake.Handler = rec.wrap(st.handler(nil))
+	if _, err := newPostgres(t, "", fake).Ensure(ctx, app); err != nil {
+		t.Fatal(err)
+	}
+	roles, schema := -1, -1
+	for i, in := range rec.stdin {
+		switch {
+		case strings.Contains(in, "ALTER DATABASE app OWNER TO app;"):
+			roles = i
+		case strings.Contains(in, "ALTER SCHEMA public OWNER TO app;"):
+			schema = i
+		}
+	}
+	if roles < 0 || schema < roles {
+		t.Fatalf("the schema must change owner after the role script: roles=%d schema=%d", roles, schema)
+	}
+	if line := rec.cmds[schema].String(); !strings.Contains(line, "psql -U postgres -d app ") {
+		t.Errorf("the schema is altered as the superuser inside the app's database: %s", line)
+	}
+	if in := rec.stdin[schema]; !strings.Contains(in, "IF current_setting('server_version_num')::int < 150000 THEN ALTER SCHEMA") {
+		t.Errorf("the change must be limited to servers older than 15:\n%s", in)
+	}
+
+	// A failure there is reported.
+	failing := &execxtest.Fake{}
+	fst := &dockerState{}
+	failing.Handler = fst.handler(func(c execx.Cmd) (string, error, bool) {
+		if strings.Contains(c.String(), "psql -U postgres -d app ") {
+			return "", errors.New("injected"), true
+		}
+		return "", nil, false
+	})
+	if _, err := newPostgres(t, "", failing).Ensure(ctx, app); err == nil {
+		t.Error("a failing schema change was not reported")
+	}
+}
+
 func FuzzRestoreOptions(f *testing.F) {
 	f.Add("2026-01-02 15:04:05+00", "drill")
 	f.Add("2026-01-02T15:04:05Z", "")

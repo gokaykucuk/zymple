@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gokaykucuk/zymple/internal/appdef"
 	"github.com/gokaykucuk/zymple/internal/releases"
@@ -47,6 +48,9 @@ type Runtime interface {
 	UpServices(ctx context.Context, app *appdef.App, release int, out io.Writer) error
 	Pin(ctx context.Context, app, digest string, release int) error
 	Repin(ctx context.Context, app, digest string, release int) error
+	// RemoveOneOffs force-removes the app's one-off containers (the release
+	// command, `zymple run`) of the releases match selects.
+	RemoveOneOffs(ctx context.Context, app string, match func(release int) bool) error
 	Tags(ctx context.Context, app string) ([]runtime.Tag, error)
 	RemoveTag(ctx context.Context, app, tag string) error
 }
@@ -97,10 +101,6 @@ type Engine struct {
 
 	mu    sync.Mutex
 	locks map[string]bool
-	// tagSeen records, per app, when cleanup first saw each tag it left
-	// alone. It is only a grace-period clock, so losing it in a restart is
-	// harmless.
-	tagSeen map[string]map[string]time.Time
 }
 
 // pushTagGrace is how long cleanup leaves a tag it cannot account for. Such
@@ -306,15 +306,7 @@ func (e *Engine) run(ctx context.Context, req request, st *releases.State, sink 
 	}
 	// From here on, a failure must leave nothing of this attempt behind.
 	abort := func(err error) (releases.Release, error) {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
-		defer cancel()
-		if rmErr := e.Runtime.RemoveWeb(cleanupCtx, app.Name, number); rmErr != nil {
-			err = fmt.Errorf("%w (removing the new container also failed: %v)", err, rmErr)
-		}
-		if rmErr := e.Runtime.RemoveCompose(app.Name, number); rmErr != nil {
-			err = fmt.Errorf("%w (removing its compose file also failed: %v)", err, rmErr)
-		}
-		return none, err
+		return none, e.abort(ctx, app.Name, number, err)
 	}
 
 	if len(app.Release) > 0 && !req.skipRelease {
@@ -363,6 +355,25 @@ func (e *Engine) run(ctx context.Context, req request, st *releases.State, sink 
 	post := context.WithoutCancel(ctx)
 	e.afterSwitch(post, app, st, previous, number, sink)
 	return rel, nil
+}
+
+// abort removes what a failed attempt started: a release command that is
+// still running, the new web container and the compose file. It returns err
+// with any cleanup failure added.
+func (e *Engine) abort(ctx context.Context, app string, number int, err error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	only := func(release int) bool { return release == number }
+	if rmErr := e.Runtime.RemoveOneOffs(ctx, app, only); rmErr != nil {
+		err = fmt.Errorf("%w (removing its release command also failed: %v)", err, rmErr)
+	}
+	if rmErr := e.Runtime.RemoveWeb(ctx, app, number); rmErr != nil {
+		err = fmt.Errorf("%w (removing the new container also failed: %v)", err, rmErr)
+	}
+	if rmErr := e.Runtime.RemoveCompose(app, number); rmErr != nil {
+		err = fmt.Errorf("%w (removing its compose file also failed: %v)", err, rmErr)
+	}
+	return err
 }
 
 // ensureImage makes sure a recorded release's image still has its name in
@@ -441,60 +452,69 @@ func (e *Engine) prune(ctx context.Context, app *appdef.App, st *releases.State,
 	if err := e.Store.Save(app.Name, st); err != nil {
 		return err
 	}
-	tags, err := e.Runtime.Tags(ctx, app.Name)
+	return e.pruneTags(ctx, app.Name, st, warn)
+}
+
+// pruneTags removes the tags cleanup no longer needs from the app's
+// repository.
+func (e *Engine) pruneTags(ctx context.Context, app string, st *releases.State, warn func(string, error)) error {
+	tags, err := e.Runtime.Tags(ctx, app)
 	if err != nil {
 		return err
 	}
-	for _, tag := range e.staleTags(app.Name, tags, kept) {
-		if err := e.Runtime.RemoveTag(ctx, app.Name, tag); err != nil {
+	for _, tag := range staleTags(st, tags, e.Now()) {
+		if err := e.Runtime.RemoveTag(ctx, app, tag); err != nil {
 			warn("cleanup", err)
+			continue
 		}
+		delete(st.PendingTags, tag)
 	}
-	return nil
+	// The first-seen times are saved so that the grace period survives a
+	// restart of the daemon.
+	return e.Store.Save(app, st)
 }
 
-// staleTags picks the tags cleanup removes now.
+// staleTags picks the tags cleanup removes now and records in st when each
+// tag it cannot account for was first seen.
 //
 // A release tag of a release that is no longer kept goes at once, and so does
-// any other tag on a kept release's image, because the release tag already
-// protects that image. Every other tag is left for pushTagGrace from the
+// any other tag on the image of the current release, which this deploy just
+// made: that is the deploy's own push tag, and the release tag already
+// protects the image. Every other tag is left for pushTagGrace from the
 // moment it is first seen: it may belong to a push whose deploy has not
-// started yet.
-func (e *Engine) staleTags(app string, tags []runtime.Tag, kept []releases.Release) []string {
-	keep := make(map[string]bool, len(kept))
-	keptDigest := make(map[string]bool, len(kept))
-	for _, r := range kept {
+// started yet, even when it names the image of an older kept release.
+func staleTags(st *releases.State, tags []runtime.Tag, now time.Time) []string {
+	keep := make(map[string]bool, len(st.Releases))
+	for _, r := range st.Releases {
 		keep[runtime.ReleaseTag(r.Number)] = true
-		keptDigest[r.Digest] = true
 	}
-	now := e.Now()
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	before := e.tagSeen[app]
-	waiting := map[string]time.Time{}
+	cur, _ := st.CurrentRelease()
+	// Rebuilding the map forgets tags that are gone.
+	pending := map[string]time.Time{}
 	var stale []string
 	for _, tag := range tags {
+		_, own := runtime.ParseReleaseTag(tag.Name)
 		switch {
 		case keep[tag.Name]:
-		case strings.HasPrefix(tag.Name, runtime.ReleaseTagPrefix) || keptDigest[tag.Digest]:
+		case own || (tag.Digest != "" && tag.Digest == cur.Digest):
 			stale = append(stale, tag.Name)
 		default:
-			first, seen := before[tag.Name]
+			first, seen := st.PendingTags[tag.Name]
 			if !seen {
-				first = now
+				first = now.UTC()
 			}
+			// The time is kept until the tag is really gone, so a removal
+			// that fails is retried by the next cleanup.
+			pending[tag.Name] = first
 			if now.Sub(first) >= pushTagGrace {
 				stale = append(stale, tag.Name)
-			} else {
-				waiting[tag.Name] = first
 			}
 		}
 	}
-	if e.tagSeen == nil {
-		e.tagSeen = map[string]map[string]time.Time{}
+	if len(pending) == 0 {
+		pending = nil
 	}
-	// Replacing the map forgets tags that are gone.
-	e.tagSeen[app] = waiting
+	st.PendingTags = pending
 	return stale
 }
 
@@ -531,10 +551,10 @@ func classifyWebs(webs []runtime.Container, current int) webState {
 }
 
 // Reconcile makes the host match the recorded state: it points the proxy at
-// the current release, removes web containers of releases that are not
-// current, starts the current one if it is stopped and brings the other
-// services up. It is run at startup, so a crash at any point of a deploy
-// converges.
+// the current release, removes web and one-off containers of releases that
+// are not current, starts the current one if it is stopped and brings the
+// other services up. It is run at startup, so a crash at any point of a
+// deploy converges.
 func (e *Engine) Reconcile(ctx context.Context, app *appdef.App) error {
 	name := app.Name
 	if !e.tryLock(name) {
@@ -560,10 +580,8 @@ func (e *Engine) Reconcile(ctx context.Context, app *appdef.App) error {
 			return err
 		}
 	}
-	for _, release := range ws.stale {
-		if err := e.Runtime.RemoveWeb(ctx, name, release); err != nil {
-			return err
-		}
+	if err := e.removeStale(ctx, name, st.Current, ws.stale); err != nil {
+		return err
 	}
 	if !ok {
 		return nil
@@ -596,6 +614,24 @@ func (e *Engine) Reconcile(ctx context.Context, app *appdef.App) error {
 	return e.Runtime.UpServices(ctx, app, cur.Number, io.Discard)
 }
 
+// removeStale removes the containers of releases that are not current: the
+// listed web containers and every one-off. A one-off left by a crash is
+// usually the release command of an attempt that never went live, and it
+// must not keep migrating beside the release that did. The caller holds the
+// app's lock, so no deploy is running its release command now.
+func (e *Engine) removeStale(ctx context.Context, app string, current int, webs []int) error {
+	notCurrent := func(release int) bool { return release != current }
+	if err := e.Runtime.RemoveOneOffs(ctx, app, notCurrent); err != nil {
+		return err
+	}
+	for _, release := range webs {
+		if err := e.Runtime.RemoveWeb(ctx, app, release); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // logWriter turns command output into log events, one per line.
 type logWriter struct {
 	sink    Sink
@@ -609,10 +645,10 @@ func (w *logWriter) Write(p []byte) (int, error) {
 	text := w.buf.String()
 	for {
 		i := strings.IndexByte(text, '\n')
-		if i < 0 && len(text) >= maxLogLine {
-			// No newline in sight: emit what there is so a command that
-			// never ends its line cannot grow the buffer without limit.
-			i = maxLogLine
+		if (i < 0 || i > maxLogLine) && len(text) >= maxLogLine {
+			// No newline within the limit: emit what there is so a command
+			// that never ends its line cannot grow the buffer without limit.
+			i = lineCut(text)
 			w.emit(text[:i])
 			text = text[i:]
 			continue
@@ -626,6 +662,21 @@ func (w *logWriter) Write(p []byte) (int, error) {
 	w.buf.Reset()
 	w.buf.WriteString(text)
 	return len(p), nil
+}
+
+// lineCut returns where to cut text, which holds at least maxLogLine bytes
+// and no newline. The cut backs up to the start of a character that would
+// otherwise be split in two.
+func lineCut(text string) int {
+	for i := maxLogLine - 1; i > maxLogLine-utf8.UTFMax; i-- {
+		if utf8.RuneStart(text[i]) {
+			if utf8.FullRuneInString(text[i:maxLogLine]) {
+				break
+			}
+			return i
+		}
+	}
+	return maxLogLine
 }
 
 func (w *logWriter) emit(line string) {

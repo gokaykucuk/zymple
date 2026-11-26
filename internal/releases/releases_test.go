@@ -3,6 +3,7 @@ package releases
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -80,5 +81,32 @@ func TestWriteFileAtomicErrors(t *testing.T) {
 	}
 	if err := WriteFileAtomic(filepath.Join(blocker, "child", "x"), []byte("x"), 0o600); err == nil {
 		t.Error("writing below a regular file should fail")
+	}
+}
+
+// The grace clock of unaccounted image tags must survive a restart.
+func TestPendingTagsRoundTrip(t *testing.T) {
+	s := &Store{Root: t.TempDir()}
+	seen := time.Unix(1_700_000_000, 0).UTC()
+	st := &State{Next: 1, PendingTags: map[string]time.Time{"push-abc": seen}}
+	if err := s.Save("shop", st); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(s.Dir("shop"), "releases.json"))
+	if err != nil || !strings.Contains(string(data), `"pending_tags"`) {
+		t.Fatalf("state file lacks pending_tags: %s, %v", data, err)
+	}
+	got, err := s.Load("shop")
+	if err != nil || len(got.PendingTags) != 1 || !got.PendingTags["push-abc"].Equal(seen) {
+		t.Fatalf("pending tags lost: %+v, %v", got, err)
+	}
+	// With nothing pending the field is left out of the file.
+	got.PendingTags = map[string]time.Time{}
+	if err := s.Save("shop", got); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(filepath.Join(s.Dir("shop"), "releases.json"))
+	if strings.Contains(string(data), "pending_tags") {
+		t.Errorf("empty pending_tags was written: %s", data)
 	}
 }

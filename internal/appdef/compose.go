@@ -20,6 +20,8 @@ var (
 	volumeRe  = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
 	// A numeric id is plain decimal: no sign, no leading zero, no other base.
 	// Docker reads "00" and "+0" as uid 0, so only one spelling is accepted.
+	// The check runs on the text in the file, not on a number YAML decoded,
+	// because YAML reads 01000, 0x3E8, 0o17, 0b11, +1 and 1_000 as numbers too.
 	numericIDRe = regexp.MustCompile(`^(0|[1-9][0-9]{0,9})$`)
 	accountRe   = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 )
@@ -50,9 +52,13 @@ var allowedServiceKeys = map[string]bool{
 // reservedEnv are variables Zymple injects; apps may not set them.
 var reservedEnv = map[string]bool{"DATABASE_URL": true, "REDIS_URL": true}
 
+// maxID is the largest uid or gid Docker accepts.
+const maxID = 2147483647
+
 // Compose is a validated compose document.
 type Compose struct {
-	// Services maps a service name to its settings.
+	// Services maps a service name to its settings. A user, when set, is
+	// always the string the operator wrote, never a decoded number.
 	Services map[string]map[string]any
 	// Volumes lists the declared named volumes.
 	Volumes []string
@@ -86,6 +92,10 @@ func ParseCompose(data []byte) (*Compose, error) {
 			return nil, fmt.Errorf("top-level key %q is not allowed", key)
 		}
 	}
+	users, err := sourceUsers(&root)
+	if err != nil {
+		return nil, err
+	}
 	c := &Compose{Services: map[string]map[string]any{}}
 	volumes, err := parseVolumes(doc["volumes"])
 	if err != nil {
@@ -107,6 +117,9 @@ func ParseCompose(data []byte) (*Compose, error) {
 		svc, ok := raw.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("service %s must be a mapping", name)
+		}
+		if text, ok := users[name]; ok {
+			svc["user"] = text
 		}
 		if err := validateService(svc, declared); err != nil {
 			return nil, fmt.Errorf("service %s: %w", name, err)
@@ -238,6 +251,69 @@ func rejectInterpolation(v any, top bool) error {
 	return nil
 }
 
+// sourceUsers returns, per service, the text its user was written as. The
+// decoded value is no use for this: YAML turns 01000 into 512 and 0x3E8 into
+// 1000, and Docker would then run a different user than the one reviewed.
+func sourceUsers(root *yaml.Node) (map[string]string, error) {
+	users := map[string]string{}
+	services := mappingValue(documentBody(root), "services")
+	if services == nil || services.Kind != yaml.MappingNode {
+		return users, nil
+	}
+	for i := 0; i+1 < len(services.Content); i += 2 {
+		node := mappingValue(services.Content[i+1], "user")
+		if node == nil {
+			continue
+		}
+		name := services.Content[i].Value
+		text, err := userText(node)
+		if err != nil {
+			return nil, fmt.Errorf("service %s: %w", name, err)
+		}
+		users[name] = text
+	}
+	return users, nil
+}
+
+// documentBody returns the top-level node of a parsed document, or nil.
+func documentBody(root *yaml.Node) *yaml.Node {
+	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
+		return nil
+	}
+	return root.Content[0]
+}
+
+// mappingValue returns the value node of key in a mapping, or nil. The
+// decoder refuses duplicate keys, so there is at most one.
+func mappingValue(n *yaml.Node, key string) *yaml.Node {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return nil
+	}
+	var found *yaml.Node
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Kind == yaml.ScalarNode && n.Content[i].Value == key {
+			found = n.Content[i+1]
+		}
+	}
+	return found
+}
+
+// userText returns the source text of a user node after checking it. Only a
+// string or a whole number is a user; null, booleans, floats and anything
+// with another tag are refused even when their text looks like a name.
+func userText(node *yaml.Node) (string, error) {
+	if node.Kind != yaml.ScalarNode {
+		return "", errors.New("user must be a string or a whole number")
+	}
+	if tag := node.ShortTag(); tag != "!!str" && tag != "!!int" {
+		return "", errors.New("user must be a string or a whole number")
+	}
+	if err := validateUser(node.Value); err != nil {
+		return "", err
+	}
+	return node.Value, nil
+}
+
 // validateUser checks a service's user against an allow-list. The value is
 // USER[:GROUP]. Anything Docker could read as uid 0 in another spelling is
 // refused by accepting exactly one spelling of a number.
@@ -245,21 +321,16 @@ func validateUser(raw any) error {
 	if raw == nil {
 		return nil
 	}
-	var value string
-	switch t := raw.(type) {
-	case string:
-		value = t
-	case int:
-		value = strconv.Itoa(t)
-	default:
+	value, ok := raw.(string)
+	if !ok {
 		return errors.New("user must be a string or a whole number")
 	}
 	user, group, hasGroup := strings.Cut(value, ":")
 	if !validUserPart(user) {
-		return errors.New("user must be a non-zero decimal uid or a lowercase account name other than root; omit it to use the image's user")
+		return errors.New("user must be a decimal uid from 1 to 2147483647 or a lowercase account name other than root; omit it to use the image's user")
 	}
 	if hasGroup && !validGroupPart(group) {
-		return errors.New("the group of user must be a decimal gid or a lowercase group name")
+		return errors.New("the group of user must be a decimal gid from 0 to 2147483647 or a lowercase group name")
 	}
 	return nil
 }
@@ -278,10 +349,10 @@ func validGroupPart(s string) bool {
 	return accountRe.MatchString(s)
 }
 
-// validID reports whether a decimal string fits a 32-bit uid or gid.
+// validID reports whether a decimal string is an id Docker accepts.
 func validID(s string) bool {
-	n, err := strconv.ParseUint(s, 10, 32)
-	return err == nil && n <= 4294967295
+	n, err := strconv.ParseInt(s, 10, 64)
+	return err == nil && n >= 0 && n <= maxID
 }
 
 func validateServiceVolumes(raw any, declared map[string]bool) error {

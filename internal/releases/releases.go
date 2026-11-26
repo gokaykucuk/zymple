@@ -33,6 +33,10 @@ type State struct {
 	Releases []Release `json:"releases"`
 	// LastError describes the most recent failed deploy, "" after a success.
 	LastError string `json:"last_error,omitempty"`
+	// PendingTags records when cleanup first saw each image tag it could
+	// not account for, usually a push that has not been deployed yet. Such
+	// a tag is removed once it has been seen for a grace period.
+	PendingTags map[string]time.Time `json:"pending_tags,omitempty"`
 }
 
 // CurrentRelease returns the release serving traffic.

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gokaykucuk/zymple/internal/appdef"
@@ -34,8 +35,10 @@ const (
 	// pgAdmin is the cluster's superuser. The app's own role is an ordinary
 	// one: a superuser can run programs and read files inside the database
 	// container, which holds the backup repository's credentials.
-	pgAdmin       = "postgres"
-	pgDatabase    = "app"
+	pgAdmin    = "postgres"
+	pgDatabase = "app"
+	// adminDatabase is the maintenance database role setup connects to.
+	adminDatabase = "postgres"
 	pgDataMount   = "/var/lib/postgresql/data"
 	pgData        = pgDataMount + "/pgdata"
 	pgRepoMount   = "/var/lib/pgbackrest"
@@ -61,6 +64,27 @@ type Postgres struct {
 	// Warn receives conditions an operator should know about that do not
 	// fail the operation. Nil discards them.
 	Warn func(msg string)
+
+	mu sync.Mutex
+	// settled holds the apps whose cluster has been through afterStart in
+	// this process. The container's label only says it was started with the
+	// wanted settings, not that its roles and stanza were set up.
+	settled map[string]bool
+}
+
+func (p *Postgres) isSettled(app string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.settled[app]
+}
+
+func (p *Postgres) setSettled(app string, done bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.settled == nil {
+		p.settled = map[string]bool{}
+	}
+	p.settled[app] = done
 }
 
 func (p *Postgres) warn(msg string) {
@@ -173,7 +197,9 @@ func (p *Postgres) URL(app string) (string, error) {
 
 // Ensure makes the app's Postgres container run with the wanted image and
 // settings, and returns the connection URL. A running container that already
-// matches is left alone, so a deploy never restarts the database.
+// matches is left alone, so a deploy never restarts the database; it only
+// gets the role and stanza setup when this process has not yet seen that
+// succeed, because the start that created it may have been interrupted.
 func (p *Postgres) Ensure(ctx context.Context, app *appdef.App) (string, error) {
 	name := PostgresContainer(app.Name)
 	pw, err := p.password(app.Name)
@@ -195,8 +221,13 @@ func (p *Postgres) Ensure(ctx context.Context, app *appdef.App) (string, error) 
 
 	state, have := inspect(ctx, p.Runner, name)
 	if state == "running" && have == want {
-		url, _ := p.URL(app.Name)
-		return url, nil
+		if !p.isSettled(app.Name) {
+			// A failure is reported, and the running database is left alone.
+			if err := p.afterStart(ctx, app, name, pw); err != nil {
+				return "", err
+			}
+		}
+		return p.URL(app.Name)
 	}
 	if archive {
 		if err := p.writeConf(ctx, app, image, conf); err != nil {
@@ -249,28 +280,41 @@ func (p *Postgres) writeConf(ctx context.Context, app *appdef.App, image, conf s
 }
 
 // afterStart waits for the server, makes sure its roles are as Zymple wants
-// them, and makes sure the backup stanza exists.
+// them, and makes sure the backup stanza exists. Every step is safe to
+// repeat. The app counts as settled only once all of them have succeeded.
 func (p *Postgres) afterStart(ctx context.Context, app *appdef.App, name, pw string) error {
+	p.setSettled(app.Name, false)
 	if err := p.waitReady(ctx, name); err != nil {
 		return err
 	}
 	if err := p.ensureRoles(ctx, app.Name, name, pw); err != nil {
 		return err
 	}
-	if !p.backupsEnabled() {
-		return nil
+	if p.backupsEnabled() {
+		if _, err := execx.Output(ctx, p.Runner, "docker", p.backrest(app.Name, "stanza-create")...); err != nil {
+			return err
+		}
 	}
-	_, err := execx.Output(ctx, p.Runner, "docker", p.backrest(app.Name, "stanza-create")...)
-	return err
+	p.setSettled(app.Name, true)
+	return nil
 }
 
-// psql runs SQL in a cluster as the given role, over the container's local
-// socket, which the image trusts. The SQL travels on stdin: it can hold a
-// password, and a command line is readable by every local user.
-func (p *Postgres) psql(ctx context.Context, name, role, sql string) (string, error) {
+// psql runs SQL in one database of a cluster as the given role, over the
+// container's local socket, which the image trusts. The SQL travels on stdin:
+// it can hold a password, and a command line is readable by every local user.
+func (p *Postgres) psql(ctx context.Context, name, role, database, sql string) (string, error) {
 	return dockerOutput(ctx, p.Runner, nil, strings.NewReader(sql), "exec", "-i", name,
-		"psql", "-U", role, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-qAt", "-f", "-")
+		"psql", "-U", role, "-d", database, "-v", "ON_ERROR_STOP=1", "-qAt", "-f", "-")
 }
+
+// schemaOwnerSQL gives the app's role the public schema on Postgres 14 and
+// older. From 15 on the schema belongs to whoever owns the database; before
+// that it belongs to the superuser, so the app's role could not grant on it,
+// drop it or recreate it.
+var schemaOwnerSQL = fmt.Sprintf(`DO $do$ BEGIN
+  IF current_setting('server_version_num')::int < 150000 THEN ALTER SCHEMA public OWNER TO %s; END IF;
+END $do$;
+`, pgUser)
 
 // ensureRoles brings a cluster's roles to the wanted shape, whatever created
 // it: a superuser named postgres for Zymple and pgBackRest, and the app's own
@@ -278,11 +322,11 @@ func (p *Postgres) psql(ctx context.Context, name, role, sql string) (string, er
 // password is re-applied at every start, so it survives a restore from
 // another host. Every statement is safe to repeat.
 func (p *Postgres) ensureRoles(ctx context.Context, app, name, pw string) error {
-	if _, err := p.psql(ctx, name, pgAdmin, "SELECT 1"); err != nil {
+	if _, err := p.psql(ctx, name, pgAdmin, adminDatabase, "SELECT 1"); err != nil {
 		// Clusters created before Zymple separated the two roles were
 		// initialised with the app's role as their only superuser.
 		create := fmt.Sprintf("CREATE ROLE %s SUPERUSER LOGIN", pgAdmin)
-		if _, legacyErr := p.psql(ctx, name, pgUser, create); legacyErr != nil {
+		if _, legacyErr := p.psql(ctx, name, pgUser, adminDatabase, create); legacyErr != nil {
 			return fmt.Errorf("no superuser to manage the cluster with: %w", errors.Join(err, legacyErr))
 		}
 	}
@@ -294,8 +338,12 @@ ALTER ROLE %[1]s LOGIN PASSWORD '%[2]s';
 ALTER DATABASE %[3]s OWNER TO %[1]s;
 SELECT rolsuper FROM pg_roles WHERE rolname = '%[1]s';
 `, pgUser, pw, pgDatabase)
-	super, err := p.psql(ctx, name, pgAdmin, sql)
+	super, err := p.psql(ctx, name, pgAdmin, adminDatabase, sql)
 	if err != nil {
+		return err
+	}
+	// A schema is altered from inside its own database.
+	if _, err := p.psql(ctx, name, pgAdmin, pgDatabase, schemaOwnerSQL); err != nil {
 		return err
 	}
 	if super == "t" {

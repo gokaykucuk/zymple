@@ -7,7 +7,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	"github.com/gokaykucuk/zymple/internal/releases"
 	"github.com/gokaykucuk/zymple/internal/runtime"
 )
 
@@ -160,11 +162,17 @@ func TestCleanupFailureIsReportedWithTheOriginalError(t *testing.T) {
 	e := newEngine(t, w)
 	mustDeploy(t, e, w, digestA)
 	w.fail["Health"] = errInjected
+	w.fail["RemoveOneOffs"] = errors.New("cannot reap")
 	w.fail["RemoveWeb"] = errors.New("cannot remove")
 	w.fail["RemoveCompose"] = errors.New("cannot delete")
 	_, err := e.Deploy(ctx, testApp(t, ""), digestB, "ci", nil)
-	if !errors.Is(err, errInjected) || !strings.Contains(err.Error(), "cannot remove") || !strings.Contains(err.Error(), "cannot delete") {
-		t.Fatalf("error should carry the cause and both cleanup failures: %v", err)
+	if !errors.Is(err, errInjected) {
+		t.Fatalf("error lost its cause: %v", err)
+	}
+	for _, want := range []string{"cannot reap", "cannot remove", "cannot delete"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error lacks the cleanup failure %q: %v", want, err)
+		}
 	}
 }
 
@@ -628,7 +636,7 @@ func TestReconcile(t *testing.T) {
 		}
 	})
 	t.Run("every failure surfaces", func(t *testing.T) {
-		for _, op := range []string{"Containers", "RemoveWeb", "ImageExists", "EnsureNetwork", "Env", "StartContainers", "Switch", "UpServices"} {
+		for _, op := range []string{"Containers", "RemoveOneOffs", "RemoveWeb", "ImageExists", "EnsureNetwork", "Env", "StartContainers", "Switch", "UpServices"} {
 			w := newWorld()
 			e := newEngine(t, w)
 			mustDeploy(t, e, w, digestA)
@@ -723,8 +731,283 @@ func TestCleanupLeavesAPendingPushAlone(t *testing.T) {
 	if w.hasTag("push-nodigest") {
 		t.Error("an abandoned tag outlived the grace period")
 	}
-	if left := e.tagSeen["shop"]; len(left) != 0 {
-		t.Errorf("first-seen times of removed tags were kept: %v", left)
+	if st, _ := e.Store.Load("shop"); len(st.PendingTags) != 0 {
+		t.Errorf("first-seen times of removed tags were kept: %v", st.PendingTags)
+	}
+}
+
+// Regression: the first-seen times lived in the Engine, so every restart of
+// the daemon started the grace period again and an abandoned push tag could
+// stay for ever.
+func TestPendingTagGraceSurvivesARestart(t *testing.T) {
+	w := newWorld()
+	now := time.Unix(1_700_000_000, 0)
+	clock := func() time.Time { return now }
+	app := testApp(t, "")
+	w.tags["push-abandoned"] = "sha256:" + strings.Repeat("d", 64)
+
+	first := newEngine(t, w)
+	first.Now = clock
+	if _, err := first.Deploy(ctx, app, digestA, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !w.hasTag("push-abandoned") {
+		t.Fatal("the tag was removed inside the grace period")
+	}
+	st, err := first.Store.Load("shop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen, ok := st.PendingTags["push-abandoned"]; !ok || !seen.Equal(now) {
+		t.Fatalf("first-seen time not recorded in the release state: %v", st.PendingTags)
+	}
+
+	// The daemon restarts: a new Engine over the same state directory.
+	second := newEngine(t, w)
+	second.Store = &releases.Store{Root: first.Store.Root}
+	second.Now = clock
+	now = now.Add(pushTagGrace + time.Minute)
+	if _, err := second.Deploy(ctx, app, digestB, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	if w.hasTag("push-abandoned") {
+		t.Error("an abandoned tag outlived the grace period because the daemon restarted")
+	}
+	if st, _ := second.Store.Load("shop"); len(st.PendingTags) != 0 {
+		t.Errorf("the removed tag is still recorded: %v", st.PendingTags)
+	}
+}
+
+// A tag whose removal fails keeps its first-seen time, so the next cleanup
+// tries again instead of waiting another grace period.
+func TestPendingTagRemovalIsRetried(t *testing.T) {
+	w := newWorld()
+	e := newEngine(t, w)
+	now := time.Unix(1_700_000_000, 0)
+	e.Now = func() time.Time { return now }
+	app := testApp(t, "")
+	w.tags["push-abandoned"] = ""
+	if _, err := e.Deploy(ctx, app, digestA, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(pushTagGrace)
+	w.fail["RemoveTag"] = errInjected
+	if _, err := e.Deploy(ctx, app, digestB, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := e.Store.Load("shop"); len(st.PendingTags) != 1 {
+		t.Fatalf("a tag that could not be removed was forgotten: %v", st.PendingTags)
+	}
+	delete(w.fail, "RemoveTag")
+	now = now.Add(time.Second)
+	if _, err := e.Deploy(ctx, app, digestC, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	if w.hasTag("push-abandoned") {
+		t.Error("the removal was not retried by the next cleanup")
+	}
+}
+
+// Regression: every tag starting with "release-" was taken for one of
+// Zymple's own and removed at once, a pushed "release-1.4.0" included.
+func TestCleanupOnlyOwnsExactReleaseTags(t *testing.T) {
+	w := newWorld()
+	e := newEngine(t, w)
+	now := time.Unix(1_700_000_000, 0)
+	e.Now = func() time.Time { return now }
+	app := testApp(t, "")
+	const pending = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	foreign := []string{"release-1.4.0", "release-07", "release-0", "release--3", "release-+4", "release-", "release-9x"}
+	for _, tag := range foreign {
+		w.tags[tag] = pending
+	}
+	w.tags["release-99"] = pending // Zymple's form, but no such release is kept
+	if _, err := e.Deploy(ctx, app, digestA, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, tag := range foreign {
+		if !w.hasTag(tag) {
+			t.Errorf("%s is not a tag Zymple makes, but it was removed at once", tag)
+		}
+	}
+	if w.hasTag("release-99") || !w.hasTag("release-1") {
+		t.Errorf("tags = %v, want release-99 gone and release-1 kept", w.tags)
+	}
+	// They are still cleaned up once the grace period is over.
+	now = now.Add(pushTagGrace)
+	if _, err := e.Deploy(ctx, app, digestB, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, tag := range foreign {
+		if w.hasTag(tag) {
+			t.Errorf("%s outlived the grace period", tag)
+		}
+	}
+}
+
+// Regression: a push tag was removed at once when its digest matched any
+// kept release. A pending re-push of an older kept image lost its tag, and
+// then its image when that release was pruned, so its deploy failed with an
+// unknown digest.
+func TestCleanupKeepsAPushOfAnOlderKeptImage(t *testing.T) {
+	w := newWorld()
+	e := newEngine(t, w)
+	app := testApp(t, "keep_releases: 3\n")
+	const third = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	w.images[third] = true
+	for _, d := range []string{digestA, digestB, third, digestA} {
+		if _, err := e.Deploy(ctx, app, d, "ci", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Another job pushes release 3's image again and has not deployed yet.
+	w.tags["push-again"] = third
+	if _, err := e.Deploy(ctx, app, digestB, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := e.Store.Load("shop")
+	if len(st.Releases) != 3 || st.Releases[0].Number != 3 || st.Releases[0].Digest != third || st.Current != 5 {
+		t.Fatalf("state = %+v, want releases 3, 4 and 5 kept", st)
+	}
+	if !w.hasTag("push-again") {
+		t.Fatal("a pending push of a kept release's image lost its tag")
+	}
+	// Release 3 is pruned by the next deploy; the push tag still holds the
+	// image for the job that is about to deploy it.
+	if _, err := e.Deploy(ctx, app, digestC, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	if w.hasTag("release-3") || !w.hasTag("push-again") {
+		t.Fatalf("tags = %v, want release-3 gone and push-again kept", w.tags)
+	}
+	// Deploying it makes the tag redundant, and it goes at once.
+	if _, err := e.Deploy(ctx, app, third, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	if w.hasTag("push-again") {
+		t.Error("the push tag of the release just made was kept")
+	}
+}
+
+// Regression: one-off containers are not listed by Containers, so the
+// release command of a failed attempt was never removed and could keep
+// migrating beside the release that stayed live.
+func TestAbortRemovesTheReleaseCommand(t *testing.T) {
+	for _, op := range []string{"RunRelease", "StartWeb", "Health", "Switch"} {
+		t.Run(op, func(t *testing.T) {
+			w := newWorld()
+			e := newEngine(t, w)
+			mustDeploy(t, e, w, digestA)
+			w.addOneOff("console", 1) // a `zymple run` on the live release
+			w.hook["RunRelease"] = func() { w.addOneOff("migrate", 2) }
+			w.fail[op] = errInjected
+			if _, err := e.Deploy(ctx, testApp(t, ""), digestB, "ci", nil); !errors.Is(err, errInjected) {
+				t.Fatalf("error = %v", err)
+			}
+			if w.hasOneOff("migrate") {
+				t.Error("the release command of the aborted release was left behind")
+			}
+			if !w.hasOneOff("console") {
+				t.Error("a one-off of the live release was removed")
+			}
+		})
+	}
+}
+
+// Failure injection: the daemon dies during the release step, so nothing
+// removes the release command's container. Reconcile at the next start does,
+// before it starts anything.
+func TestReconcileRemovesAnOrphanedReleaseCommand(t *testing.T) {
+	app := testApp(t, "")
+	w := newWorld()
+	e := newEngine(t, w)
+	mustDeploy(t, e, w, digestA)
+	w.addOneOff("console", 1)
+	w.hook["RunRelease"] = func() { w.addOneOff("migrate", 2) }
+	w.fail["RunRelease"] = errInjected
+	// The crash: the attempt's own cleanup never happens.
+	w.fail["RemoveOneOffs"] = errors.New("daemon killed")
+	if _, err := e.Deploy(ctx, app, digestB, "ci", nil); !errors.Is(err, errInjected) {
+		t.Fatalf("error = %v", err)
+	}
+	if !w.hasOneOff("migrate") {
+		t.Fatal("the test did not leave an orphaned one-off")
+	}
+	delete(w.fail, "RunRelease")
+	delete(w.fail, "RemoveOneOffs")
+	w.webs[1] = false // the host rebooted
+	w.resetLog()
+
+	restarted := newEngine(t, w)
+	restarted.Store = &releases.Store{Root: e.Store.Root}
+	if err := restarted.Reconcile(ctx, app); err != nil {
+		t.Fatal(err)
+	}
+	if w.hasOneOff("migrate") {
+		t.Error("the orphaned release command of release 2 is still there")
+	}
+	if !w.hasOneOff("console") {
+		t.Error("a one-off of the current release was removed")
+	}
+	rm := w.indexOf("RemoveOneOffs")
+	for _, start := range []string{"Env", "StartContainers c1", "UpServices 1"} {
+		if at := w.indexOf(start); rm < 0 || at < 0 || rm > at {
+			t.Errorf("want RemoveOneOffs before %s, got %v", start, w.log)
+		}
+	}
+	if w.calls("StartWeb") != 0 || w.calls("RemoveWeb") != 0 {
+		t.Errorf("a one-off was taken for a web container: %v", w.log)
+	}
+
+	// With no release at all, every one-off is a leftover.
+	bare := newWorld()
+	bare.addOneOff("migrate", 1)
+	if err := newEngine(t, bare).Reconcile(ctx, app); err != nil {
+		t.Fatal(err)
+	}
+	if bare.hasOneOff("migrate") {
+		t.Error("a one-off of an app without a release was kept")
+	}
+}
+
+// Regression: a line without a newline was cut at exactly 64 KiB, in the
+// middle of a multi-byte character, and both halves became invalid UTF-8.
+func TestLogWriterCutsOnACharacterBoundary(t *testing.T) {
+	for _, char := range []string{"é", "€", "𝄞"} {
+		for pad := 0; pad < len(char); pad++ {
+			var ev events
+			w := &logWriter{sink: ev.sink, step: "release"}
+			input := strings.Repeat("a", pad) + strings.Repeat(char, 3*maxLogLine/len(char))
+			_, _ = w.Write([]byte(input + "\n"))
+			var got strings.Builder
+			for _, e := range ev.list {
+				if !utf8.ValidString(e.Message) {
+					t.Fatalf("%q with %d bytes before it: a line was cut inside a character", char, pad)
+				}
+				if len(e.Message) > maxLogLine {
+					t.Fatalf("a line of %d bytes is over the limit", len(e.Message))
+				}
+				got.WriteString(e.Message)
+			}
+			if got.String() != input {
+				t.Fatalf("%q with %d bytes before it: output was lost or changed", char, pad)
+			}
+		}
+	}
+	// Bytes that are not UTF-8 at all are still cut at the limit.
+	var ev events
+	w := &logWriter{sink: ev.sink}
+	_, _ = w.Write([]byte(strings.Repeat("\x80", maxLogLine+10)))
+	if len(ev.list) != 1 || len(ev.list[0].Message) != maxLogLine {
+		t.Fatalf("invalid bytes: %d events", len(ev.list))
+	}
+	// A character still arriving at the limit waits for its last bytes.
+	ev = events{}
+	w = &logWriter{sink: ev.sink}
+	_, _ = w.Write([]byte(strings.Repeat("a", maxLogLine-1) + "\xe2\x82"))
+	_, _ = w.Write([]byte("\xac\n"))
+	if len(ev.list) != 2 || ev.list[0].Message != strings.Repeat("a", maxLogLine-1) || ev.list[1].Message != "€" {
+		t.Fatalf("a character split across writes was not kept whole: %d events", len(ev.list))
 	}
 }
 

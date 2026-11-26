@@ -117,7 +117,8 @@ zymple run myapp -- bin/console
 ```
 
 `run` is not interactive: it runs the command in a one-off container and
-prints its output.
+prints its output. A `zymple run` still running on a release that is no
+longer current is removed by the next `zymple reload` or daemon start.
 
 ## The Postgres image
 
@@ -166,9 +167,13 @@ Omit `--time` to restore to the latest archived state.
   clean shutdown, on the next deploy or reload: expect a short database
   restart. Redis containers are replaced once too, because the default image
   is now pinned by digest.
-- Existing clusters keep `app` as a superuser and log a warning. See the
+- Existing clusters keep `app` as a superuser and log a warning on the first
+  deploy or reload after the upgrade, with or without a backup repository. See the
   spec's Postgres section for how to get the split.
 - Replace the unit file: it now sets `KillMode=mixed`.
+- `user` in a compose file now takes only a lowercase account name or a
+  plain decimal id. A definition that no longer validates is not loaded when
+  the daemon starts, so check definitions before restarting.
 
 ## Rebuilding a host
 
@@ -182,6 +187,8 @@ Omit `--time` to restore to the latest archived state.
 
 - **Do not run `docker image prune -a` or `docker system prune -a`.** They
   delete the images rollback needs. Zymple removes old images itself.
+- Do not replace an app directory with a symlink. Zymple loads plain
+  directories only; it keeps the old definition and reports an error.
 - Do not edit `/etc/caddy/zymple/*.caddy` or anything under
   `/var/lib/zymple`. Both are overwritten.
 - Do not give anyone docker access on the host who should not be root.

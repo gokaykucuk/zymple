@@ -18,6 +18,7 @@ import (
 	"github.com/containerd/containerd/v2/core/metadata"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/errdefs"
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
@@ -502,4 +503,148 @@ func FuzzManifestPut(f *testing.F) {
 			t.Fatalf("a repository that owns no blobs stored manifest %s: %s", dgst, doc)
 		}
 	})
+}
+
+// lenientStore answers a commit the way containerd's content service does
+// over its API: when the host already has the expected digest it reports
+// "already exists" and discards the upload without looking at the bytes.
+// The in-process local store checks the bytes first, so only this wrapper
+// shows what happens against a real daemon.
+type lenientStore struct{ content.Store }
+
+func (s lenientStore) Writer(ctx context.Context, opts ...content.WriterOpt) (content.Writer, error) {
+	w, err := s.Store.Writer(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return lenientWriter{Writer: w, store: s.Store}, nil
+}
+
+type lenientWriter struct {
+	content.Writer
+	store content.Store
+}
+
+func (w lenientWriter) Commit(ctx context.Context, size int64, expected digest.Digest, opts ...content.Opt) error {
+	if _, err := w.store.Info(ctx, expected); err == nil {
+		_ = w.Writer.Close()
+		return errdefs.ErrAlreadyExists
+	}
+	return w.Writer.Commit(ctx, size, expected, opts...)
+}
+
+type lenientStores struct{ inProcess }
+
+func (s lenientStores) ContentStore() content.Store { return lenientStore{s.inProcess.ContentStore()} }
+
+// Regression: ownership was granted on containerd's "already exists" answer,
+// which does not mean the uploaded bytes matched. An empty or junk upload
+// under another app's digest made that app's layer one's own.
+func TestOwnershipNeedsTheBytesNotJustTheDigest(t *testing.T) {
+	_, _, stores := newRepo(t)
+	reg := New(lenientStores{stores}, "moby")
+	shop := otherRepo(t, reg, "zymple/shop")
+	other := otherRepo(t, reg, "zymple/other")
+	layer := []byte("shop's private layer")
+	dgst := digest.FromBytes(layer)
+	if _, err := shop.Blobs(ctx).Put(ctx, octetStream, layer); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string][]byte{"empty": nil, "junk": []byte("not the layer")} {
+		w, err := other.Blobs(ctx).Create(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(body) > 0 {
+			if _, err := w.Write(body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var invalid distribution.ErrBlobInvalidDigest
+		if _, err := w.Commit(ctx, v1.Descriptor{Digest: dgst}); !errors.As(err, &invalid) {
+			t.Errorf("%s upload under shop's digest: %v, want an invalid digest error", name, err)
+		}
+		_ = w.Close()
+		if _, err := other.Blobs(ctx).Stat(ctx, dgst); !errors.Is(err, distribution.ErrBlobUnknown) {
+			t.Errorf("%s upload under shop's digest made the blob other's: %v", name, err)
+		}
+	}
+	// A wrong size with the right bytes is refused too.
+	w, _ := other.Blobs(ctx).Create(ctx)
+	_, _ = w.Write(layer)
+	if _, err := w.Commit(ctx, v1.Descriptor{Digest: dgst, Size: int64(len(layer)) + 1}); err == nil {
+		t.Error("a wrong size was accepted")
+	}
+	_ = w.Close()
+	// The real bytes are what makes it other's.
+	w, _ = other.Blobs(ctx).Create(ctx)
+	_, _ = w.Write(layer)
+	if _, err := w.Commit(ctx, v1.Descriptor{Digest: dgst}); err != nil {
+		t.Fatalf("uploading the real bytes: %v", err)
+	}
+	_ = w.Close()
+	if _, err := other.Blobs(ctx).Stat(ctx, dgst); err != nil {
+		t.Errorf("after uploading the real bytes: %v", err)
+	}
+}
+
+func imageIndex(children ...[]byte) []byte {
+	var entries []string
+	for _, child := range children {
+		entries = append(entries, `{"mediaType":"`+v1.MediaTypeImageManifest+`","digest":"`+digest.FromBytes(child).String()+
+			`","size":`+strconv.Itoa(len(child))+`}`)
+	}
+	return []byte(`{"schemaVersion":2,"mediaType":"` + v1.MediaTypeImageIndex + `","manifests":[` + strings.Join(entries, ",") + `]}`)
+}
+
+// Regression: an index was only checked one level deep, and a manifest
+// uploaded as an ordinary blob is never checked at all. Together they let a
+// repository reach another app's layers through an index.
+func TestIndexOnlyNamesVerifiedManifests(t *testing.T) {
+	shop, reg, _ := newRepo(t)
+	other := otherRepo(t, reg, "zymple/other")
+	config, layer := []byte(`{"architecture":"amd64","os":"linux"}`), []byte("shop's private layer")
+	for _, blob := range [][]byte{config, layer} {
+		if _, err := shop.Blobs(ctx).Put(ctx, octetStream, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// other holds its own config and the bytes of a manifest naming shop's
+	// layer, both pushed as plain blobs.
+	evil := []byte(`{"architecture":"amd64","os":"linux","config":{"Entrypoint":["cat","/secret"]}}`)
+	smuggled := imageManifest(evil, layer)
+	for _, blob := range [][]byte{evil, smuggled} {
+		if _, err := other.Blobs(ctx).Put(ctx, octetStream, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifests, _ := other.Manifests(ctx)
+	index, err := unmarshalManifest(imageIndex(smuggled))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manifests.Put(ctx, index); err == nil {
+		t.Fatal("an index naming a manifest that was never verified was accepted")
+	}
+	// An image manifest may not name a manifest as one of its blobs either.
+	nested := []byte(strings.Replace(string(imageManifest(evil, smuggled)), v1.MediaTypeImageLayerGzip, v1.MediaTypeImageManifest, 1))
+	if parsed, err := unmarshalManifest(nested); err == nil {
+		if _, err := manifests.Put(ctx, parsed); err == nil {
+			t.Fatal("an image manifest naming a manifest as a layer was accepted")
+		}
+	}
+	// A manifest that went through Put is fine in an index.
+	own := []byte("other's own layer")
+	if _, err := other.Blobs(ctx).Put(ctx, octetStream, own); err != nil {
+		t.Fatal(err)
+	}
+	child := imageManifest(evil, own)
+	parsedChild, _ := unmarshalManifest(child)
+	if _, err := manifests.Put(ctx, parsedChild); err != nil {
+		t.Fatal(err)
+	}
+	good, _ := unmarshalManifest(imageIndex(child))
+	if _, err := manifests.Put(ctx, good); err != nil {
+		t.Fatalf("an index of verified manifests was refused: %v", err)
+	}
 }
