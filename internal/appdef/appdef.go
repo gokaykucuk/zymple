@@ -58,15 +58,28 @@ type Web struct {
 	Drain         Duration `yaml:"drain"`
 }
 
+// Default names of the variables that carry the managed services' URLs.
+const (
+	DefaultPostgresEnv = "DATABASE_URL"
+	DefaultRedisEnv    = "REDIS_URL"
+)
+
+var envNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
+
 // Postgres declares a managed Postgres cluster.
 type Postgres struct {
 	Version  int `yaml:"version"`
 	PITRDays int `yaml:"pitr_days"`
+	// Env is the variable the connection URL is injected as. Apps that read
+	// their own name for it set this instead of renaming it in compose.
+	Env string `yaml:"env"`
 }
 
 // Redis declares a managed Redis instance.
 type Redis struct {
 	Persistent bool `yaml:"persistent"`
+	// Env is the variable the connection URL is injected as.
+	Env string `yaml:"env"`
 }
 
 // App is one validated app definition.
@@ -118,6 +131,9 @@ func Parse(appYAML, composeYAML []byte) (*App, error) {
 	}
 	compose, err := ParseCompose(composeYAML)
 	if err != nil {
+		return nil, fmt.Errorf("compose: %w", err)
+	}
+	if err := app.checkInjectedEnv(compose); err != nil {
 		return nil, fmt.Errorf("compose: %w", err)
 	}
 	if _, ok := compose.Services[app.Web.Service]; !ok {
@@ -174,6 +190,12 @@ func (a *App) applyDefaults() {
 	if a.Postgres != nil && a.Postgres.PITRDays == 0 {
 		a.Postgres.PITRDays = DefaultPITRDays
 	}
+	if a.Postgres != nil && a.Postgres.Env == "" {
+		a.Postgres.Env = DefaultPostgresEnv
+	}
+	if a.Redis != nil && a.Redis.Env == "" {
+		a.Redis.Env = DefaultRedisEnv
+	}
 }
 
 func (a *App) validate() error {
@@ -197,7 +219,47 @@ func (a *App) validate() error {
 	if a.KeepReleases < 1 || a.KeepReleases > 50 {
 		return errors.New("keep_releases must be between 1 and 50")
 	}
-	return a.Postgres.validate()
+	if err := a.Postgres.validate(); err != nil {
+		return err
+	}
+	if a.Redis != nil && !envNameRe.MatchString(a.Redis.Env) {
+		return fmt.Errorf("redis.env %q must match %s", a.Redis.Env, envNameRe)
+	}
+	if a.Postgres != nil && a.Redis != nil && a.Postgres.Env == a.Redis.Env {
+		return fmt.Errorf("postgres.env and redis.env are both %q", a.Redis.Env)
+	}
+	return nil
+}
+
+// InjectedEnv lists the variables Zymple sets for this app's managed
+// services. The app's own configuration may not set them.
+func (a *App) InjectedEnv() []string {
+	var names []string
+	if a.Postgres != nil {
+		names = append(names, a.Postgres.Env)
+	}
+	if a.Redis != nil {
+		names = append(names, a.Redis.Env)
+	}
+	return names
+}
+
+// checkInjectedEnv refuses a compose file that sets a variable Zymple
+// injects: the app would silently talk to something other than its own
+// database.
+func (a *App) checkInjectedEnv(compose *Compose) error {
+	for _, service := range compose.ServiceNames() {
+		env, err := Environment(compose.Services[service])
+		if err != nil {
+			return err
+		}
+		for _, name := range a.InjectedEnv() {
+			if _, set := env[name]; set {
+				return fmt.Errorf("service %s: environment %s is set by zymple", service, name)
+			}
+		}
+	}
+	return nil
 }
 
 func validateDomains(domains []string) error {
@@ -221,6 +283,9 @@ func (p *Postgres) validate() error {
 	}
 	if p.PITRDays < 1 || p.PITRDays > 365 {
 		return errors.New("postgres.pitr_days must be between 1 and 365")
+	}
+	if !envNameRe.MatchString(p.Env) {
+		return fmt.Errorf("postgres.env %q must match %s", p.Env, envNameRe)
 	}
 	return nil
 }
