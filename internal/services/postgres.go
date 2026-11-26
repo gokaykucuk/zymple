@@ -31,6 +31,7 @@ const (
 	envPGData    = "PGDATA="
 	rolePostgres = "postgres"
 	roleRedis    = "redis"
+	roleDrill    = "postgres-drill"
 	pgUser       = "app"
 	// pgAdmin is the cluster's superuser. The app's own role is an ordinary
 	// one: a superuser can run programs and read files inside the database
@@ -553,7 +554,7 @@ func (p *Postgres) Restore(ctx context.Context, app *appdef.App, opts RestoreOpt
 	}
 	args := []string{"run", "-d", "--name", name,
 		"--network", appdef.Network(app.Name), "--network-alias", "postgres-drill-" + opts.Into,
-		flagLabel, appdef.LabelApp + "=" + app.Name, flagLabel, appdef.LabelRole + "=postgres-drill",
+		flagLabel, appdef.LabelApp + "=" + app.Name, flagLabel, appdef.LabelRole + "=" + roleDrill,
 		"--shm-size", "256m", "-e", envPGData + pgData}
 	args = append(args, p.mounts(app.Name, dataDir)...)
 	args = append(args, image)
@@ -569,8 +570,24 @@ func (p *Postgres) RemoveDrill(ctx context.Context, app, drill string) error {
 	if !drillRe.MatchString(drill) {
 		return fmt.Errorf("drill name %q must match %s", drill, drillRe)
 	}
-	if _, err := execx.Output(ctx, p.Runner, "docker", "rm", "-f", DrillContainer(app, drill)); err != nil {
+	name := DrillContainer(app, drill)
+	// The name alone does not say whose container this is: the drill
+	// "postgres" of app "a" and the live database of an app called
+	// "a-postgres-drill" are both "zymple-a-postgres-drill-postgres". Only a
+	// container Zymple labelled as this app's drill is removed.
+	owner, err := execx.Output(ctx, p.Runner, "docker", "inspect", "--format",
+		fmt.Sprintf(`{{index .Config.Labels %q}} {{index .Config.Labels %q}}`, appdef.LabelApp, appdef.LabelRole), name)
+	switch {
+	case err != nil && strings.Contains(strings.ToLower(err.Error()), "no such"):
+		// The container is already gone; its data may still be there.
+	case err != nil:
 		return err
+	case owner != app+" "+roleDrill:
+		return fmt.Errorf("container %s is not a drill cluster of app %s; not removing it", name, app)
+	default:
+		if _, err := execx.Output(ctx, p.Runner, "docker", "rm", "-f", name); err != nil {
+			return err
+		}
 	}
 	return os.RemoveAll(filepath.Join(p.dir(app), "drill-"+drill))
 }

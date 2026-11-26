@@ -76,6 +76,12 @@ func Authorize(app, method, urlPath string) bool {
 	}
 	switch {
 	case rest == "blobs/uploads" || strings.HasPrefix(rest, "blobs/uploads/"):
+		// Only the upload collection and one upload id. Anything deeper
+		// would be read by the registry as a repository of its own, named
+		// "<repository>/blobs/uploads/...", which nothing ever cleans up.
+		if id := strings.TrimPrefix(strings.TrimPrefix(rest, "blobs/uploads"), "/"); strings.Contains(id, "/") {
+			return false
+		}
 		switch method {
 		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodGet, http.MethodDelete:
 			return true

@@ -425,6 +425,48 @@ func TestBusyAppAnswersConflict(t *testing.T) {
 	unlock()
 }
 
+// Regression: nothing bounded how many log streams a token could hold open,
+// each with its own `docker logs` process and backlog.
+func TestLogStreamsAreBoundedPerApp(t *testing.T) {
+	f := newFixture(t, false)
+	f.deploy(t, digestA)
+	const logs = "/api/v1/apps/shop/logs"
+	var held []func()
+	for i := 0; i < maxLogStreams; i++ {
+		release, ok := f.logSlot("shop")
+		if !ok {
+			t.Fatalf("slot %d of %d was refused", i+1, maxLogStreams)
+		}
+		held = append(held, release)
+	}
+	if code, body, _ := call(f.network, "GET", logs, token, ""); code != http.StatusTooManyRequests {
+		t.Errorf("logs with every slot taken: %d %s, want 429", code, body)
+	}
+	if f.fake.Count("docker logs") != 0 {
+		t.Error("a refused stream still started docker logs")
+	}
+	if _, ok := f.logSlot("other"); !ok {
+		t.Error("one app's streams used up another app's slots")
+	}
+	held[0]()
+	if code, _, events := call(f.network, "GET", logs, token, ""); code != 200 || outcome(events).Status != "ok" {
+		t.Errorf("logs after a slot was freed: %d %+v", code, events)
+	}
+	// A finished stream gives its slot back, so the freed one is free again.
+	if code, _, _ := call(f.network, "GET", logs, token, ""); code != 200 {
+		t.Errorf("a finished stream kept its slot: %d", code)
+	}
+	for _, release := range held[1:] {
+		release()
+	}
+	f.logMu.Lock()
+	left := f.logStreams["shop"]
+	f.logMu.Unlock()
+	if left != 0 {
+		t.Errorf("%d slots still counted after every stream ended", left)
+	}
+}
+
 func TestLogs(t *testing.T) {
 	f := newFixture(t, false)
 	f.deploy(t, digestA)

@@ -82,7 +82,12 @@ switched.
   list the catalog, or push outside the `zymple/` namespace.
 - The operator routes return 404 on the network listener.
 - Fuzzing asserts that no accepted registry path leaves the app's repository
-  and that no read is ever authorised.
+  and that no read is ever authorised. The repository is the one the
+  registry's own router resolves the path to, not a prefix of the text.
+- A path the registry would read as a repository nested under the app's own
+  is refused, and no image is created from it.
+- An app can hold only a bounded number of log streams open.
+- The CLI replaces terminal control sequences in output it prints.
 - A caller-supplied digest whose content exists only under another app is
   refused.
 
@@ -140,7 +145,8 @@ a backup and survives a deploy.
   Redis, S3 and directory repositories.
 - Unit: role setup on a new cluster and on one whose superuser is still
   `app`; a failed Redis restore starts Redis again; database containers are
-  stopped gracefully before they are replaced.
+  stopped gracefully before they are replaced; a drill is removed only
+  when the container carries the app's drill labels.
 - Fuzzing asserts that accepted restore options only ever produce arguments
   of the validated shape.
 - By hand against real images, not yet in the suite: the role split on

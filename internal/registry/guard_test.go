@@ -3,8 +3,12 @@ package registry
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+
+	v2 "github.com/distribution/distribution/v3/registry/api/v2"
+	"github.com/gorilla/mux"
 
 	"github.com/gokaykucuk/zymple/internal/auth"
 )
@@ -46,6 +50,12 @@ func TestAuthorize(t *testing.T) {
 		{"GET", "/", false},
 		{"GET", "/v2/zymple/shop", false},
 		{"TRACE", "/v2/zymple/shop/blobs/uploads/x", false},
+		// Paths the registry would read as a repository nested under the
+		// app's own, "zymple/shop/blobs/uploads/x".
+		{"POST", "/v2/zymple/shop/blobs/uploads/x/blobs/uploads/", false},
+		{"PUT", "/v2/zymple/shop/blobs/uploads/x/manifests/latest", false},
+		{"HEAD", "/v2/zymple/shop/blobs/uploads/x/blobs/sha256:abc", false},
+		{"PATCH", "/v2/zymple/shop/blobs/uploads/x/y", false},
 	}
 	for _, c := range cases {
 		if got := Authorize("shop", c.method, c.path); got != c.want {
@@ -129,10 +139,14 @@ func TestGuard(t *testing.T) {
 	}
 }
 
+// registryRouter is the router the embedded registry dispatches with.
+var registryRouter = v2.Router()
+
 func FuzzAuthorize(f *testing.F) {
 	f.Add("PUT", "/v2/zymple/shop/manifests/latest")
 	f.Add("GET", "/v2/zymple/shop/../other/blobs/x")
 	f.Add("POST", "/v2/zymple/shopx/blobs/uploads/")
+	f.Add("PUT", "/v2/zymple/shop/blobs/uploads/x/manifests/latest")
 	f.Fuzz(func(t *testing.T, method, path string) {
 		if !Authorize("shop", method, path) {
 			return
@@ -145,6 +159,13 @@ func FuzzAuthorize(f *testing.F) {
 		}
 		if method == "GET" && !strings.Contains(path, "/blobs/uploads") {
 			t.Fatalf("authorized a read: %q", path)
+		}
+		// What matters is the repository the registry itself resolves the
+		// path to, not what the path looks like.
+		var match mux.RouteMatch
+		req := &http.Request{Method: method, URL: &url.URL{Path: path}}
+		if registryRouter.Match(req, &match) && match.Vars["name"] != "zymple/shop" {
+			t.Fatalf("authorized %s %q, which the registry routes to repository %q", method, path, match.Vars["name"])
 		}
 	})
 }

@@ -416,3 +416,30 @@ func TestShortDigest(t *testing.T) {
 		t.Errorf("shortDigest = %q", got)
 	}
 }
+
+// Regression: container output was printed as it came, so an image could
+// send terminal control sequences to whoever ran `zymple logs` or a deploy.
+func TestPrintableKeepsColoursAndNothingElse(t *testing.T) {
+	for in, want := range map[string]string{
+		"plain text\twith a tab":            "plain text\twith a tab",
+		"\x1b[1;31mred\x1b[0m":              "\x1b[1;31mred\x1b[0m",
+		"clear\x1b[2J\x1b[H":                "clear\ufffd[2J\ufffd[H",
+		"title\x1b]0;pwned\x07":             "title\ufffd]0;pwned\ufffd",
+		"clipboard\x1b]52;c;ZWNobw==\x1b\\": "clipboard\ufffd]52;c;ZWNobw==\ufffd\\",
+		"overwrite\rfake line\b":            "overwrite\ufffdfake line\ufffd",
+		"c1 \u009b31m csi":                  "c1 \ufffd31m csi",
+		"del\x7f nul\x00":                   "del\ufffd nul\ufffd",
+		"héllo wörld ✓":                     "héllo wörld ✓",
+	} {
+		if got := printable(in); got != want {
+			t.Errorf("printable(%q) = %q, want %q", in, got, want)
+		}
+	}
+	var out bytes.Buffer
+	print := printer(Env{Stdout: &out})
+	print(deploy.Event{Step: "start", Status: "log", Message: "a\x1b[2Kb"})
+	print(deploy.Event{Step: "health", Status: "fail", Message: "x\x1b[1A"})
+	if strings.Contains(out.String(), "\x1b") {
+		t.Errorf("an escape sequence reached the terminal: %q", out.String())
+	}
+}

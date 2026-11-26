@@ -90,7 +90,9 @@ publish nothing; apps reach them over the app's Docker network.
 - An unknown app and a wrong token get the same answer.
 - The registry guard allows only what a push needs: the version check, blob
   and manifest existence checks, and uploads. Reading blobs or manifests,
-  listing, deleting and cross-repository mounts are refused.
+  listing, deleting and cross-repository mounts are refused. So is any path
+  the registry would read as a repository nested under the app's own, such
+  as `zymple/<app>/blobs/uploads/x`.
 - A blob belongs to the repositories that uploaded its bytes. Existence
   checks and manifests see only the app's own blobs, so a manifest cannot
   name content another app pushed, even when the digest is known.
@@ -317,7 +319,10 @@ Operator commands, on the host:
 - `zymple pg restore <app> --into <name> [--time <ts>]`: a drill cluster
   beside the live one, with archiving off, reachable on the app's network as
   `postgres-drill-<name>`.
-- `zymple pg drill-rm <app> <name>`
+- `zymple pg drill-rm <app> <name>`: removes the container only when it
+  carries this app's drill labels. A container name alone does not say whose
+  it is: the drill `postgres` of app `a` and the database of an app called
+  `a-postgres-drill` have the same name.
 - `zymple pg psql <app>`
 
 Before a restore, the latest WAL segment is archived so that any time up to
@@ -398,7 +403,15 @@ Known limits:
   on a command line, where any local user could read them.
 - Long streams are bounded: past 10000 undelivered events, or 16 MiB of
   undelivered output, the oldest are dropped, and output with no line ending
-  is cut into lines of at most 64 KiB, never inside a UTF-8 character.
+  is cut into lines of at most 64 KiB, never inside a UTF-8 character. An
+  app has at most 8 log streams open at once; the next one gets HTTP 429.
+- The CLI prints container output with colours intact and every other
+  control character replaced, so an image cannot drive the terminal of
+  whoever reads its logs.
+- The default Postgres image is a tag, `zymple-postgres:<major>`, which this
+  repository rebuilds weekly, while the Redis and restic defaults are pinned
+  by digest. Docker pulls it only when the host does not have it. To pin it,
+  set `postgres_images` to a reference with a digest.
 
 ## Decisions made while building
 
