@@ -21,6 +21,7 @@ import (
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Stores is what the backend needs from containerd. *client.Client
@@ -67,8 +68,15 @@ func (r *Registry) Repositories(context.Context, []string, string) (int, error) 
 // containerd's job.
 func (r *Registry) Blobs() distribution.BlobEnumerator { return unsupportedEnumerator{} }
 
-// BlobStatter returns a statter over the whole content store.
-func (r *Registry) BlobStatter() distribution.BlobStatter { return &blobStore{reg: r} }
+// BlobStatter returns a statter that knows no blobs. A blob is only visible
+// through the repository it was pushed to; nothing may look across them.
+func (r *Registry) BlobStatter() distribution.BlobStatter { return noBlobs{} }
+
+type noBlobs struct{}
+
+func (noBlobs) Stat(context.Context, digest.Digest) (v1.Descriptor, error) {
+	return v1.Descriptor{}, distribution.ErrBlobUnknown
+}
 
 type unsupportedEnumerator struct{}
 
@@ -86,10 +94,12 @@ var _ distribution.Repository = (*repository)(nil)
 func (r *repository) Named() reference.Named { return r.name }
 
 func (r *repository) Manifests(context.Context, ...distribution.ManifestServiceOption) (distribution.ManifestService, error) {
-	return &manifestService{repo: r.name, blobs: &blobStore{reg: r.reg}}, nil
+	return &manifestService{repo: r.name, blobs: r.blobs()}, nil
 }
 
-func (r *repository) Blobs(context.Context) distribution.BlobStore { return &blobStore{reg: r.reg} }
+func (r *repository) Blobs(context.Context) distribution.BlobStore { return r.blobs() }
+
+func (r *repository) blobs() *blobStore { return &blobStore{reg: r.reg, repo: r.name.Name()} }
 
 func (r *repository) Tags(context.Context) distribution.TagService {
 	return &tagService{reg: r.reg, repo: r.name}

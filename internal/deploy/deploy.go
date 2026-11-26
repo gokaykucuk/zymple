@@ -47,7 +47,7 @@ type Runtime interface {
 	UpServices(ctx context.Context, app *appdef.App, release int, out io.Writer) error
 	Pin(ctx context.Context, app, digest string, release int) error
 	Repin(ctx context.Context, app, digest string, release int) error
-	Tags(ctx context.Context, app string) ([]string, error)
+	Tags(ctx context.Context, app string) ([]runtime.Tag, error)
 	RemoveTag(ctx context.Context, app, tag string) error
 }
 
@@ -97,7 +97,20 @@ type Engine struct {
 
 	mu    sync.Mutex
 	locks map[string]bool
+	// tagSeen records, per app, when cleanup first saw each tag it left
+	// alone. It is only a grace-period clock, so losing it in a restart is
+	// harmless.
+	tagSeen map[string]map[string]time.Time
 }
+
+// pushTagGrace is how long cleanup leaves a tag it cannot account for. Such
+// a tag is usually an image another CI job has pushed and is about to
+// deploy; removing it would make that deploy fail with an unknown digest.
+const pushTagGrace = time.Hour
+
+// maxLogLine bounds one line of command output. Output without a newline is
+// cut into lines of this size instead of growing in memory.
+const maxLogLine = 64 << 10
 
 func (e *Engine) tryLock(app string) bool {
 	e.mu.Lock()
@@ -428,18 +441,11 @@ func (e *Engine) prune(ctx context.Context, app *appdef.App, st *releases.State,
 	if err := e.Store.Save(app.Name, st); err != nil {
 		return err
 	}
-	keep := make(map[string]bool, len(kept))
-	for _, r := range kept {
-		keep[runtime.ReleaseTag(r.Number)] = true
-	}
 	tags, err := e.Runtime.Tags(ctx, app.Name)
 	if err != nil {
 		return err
 	}
-	for _, tag := range tags {
-		if keep[tag] {
-			continue
-		}
+	for _, tag := range e.staleTags(app.Name, tags, kept) {
 		if err := e.Runtime.RemoveTag(ctx, app.Name, tag); err != nil {
 			warn("cleanup", err)
 		}
@@ -447,10 +453,88 @@ func (e *Engine) prune(ctx context.Context, app *appdef.App, st *releases.State,
 	return nil
 }
 
-// Reconcile makes the host match the recorded state: it removes web
-// containers of releases that are not current, starts the current one if it
-// is stopped, points the proxy at it and brings the other services up. It is
-// run at startup, so a crash at any point of a deploy converges.
+// staleTags picks the tags cleanup removes now.
+//
+// A release tag of a release that is no longer kept goes at once, and so does
+// any other tag on a kept release's image, because the release tag already
+// protects that image. Every other tag is left for pushTagGrace from the
+// moment it is first seen: it may belong to a push whose deploy has not
+// started yet.
+func (e *Engine) staleTags(app string, tags []runtime.Tag, kept []releases.Release) []string {
+	keep := make(map[string]bool, len(kept))
+	keptDigest := make(map[string]bool, len(kept))
+	for _, r := range kept {
+		keep[runtime.ReleaseTag(r.Number)] = true
+		keptDigest[r.Digest] = true
+	}
+	now := e.Now()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	before := e.tagSeen[app]
+	waiting := map[string]time.Time{}
+	var stale []string
+	for _, tag := range tags {
+		switch {
+		case keep[tag.Name]:
+		case strings.HasPrefix(tag.Name, runtime.ReleaseTagPrefix) || keptDigest[tag.Digest]:
+			stale = append(stale, tag.Name)
+		default:
+			first, seen := before[tag.Name]
+			if !seen {
+				first = now
+			}
+			if now.Sub(first) >= pushTagGrace {
+				stale = append(stale, tag.Name)
+			} else {
+				waiting[tag.Name] = first
+			}
+		}
+	}
+	if e.tagSeen == nil {
+		e.tagSeen = map[string]map[string]time.Time{}
+	}
+	// Replacing the map forgets tags that are gone.
+	e.tagSeen[app] = waiting
+	return stale
+}
+
+// webState is what Reconcile found among an app's web containers.
+type webState struct {
+	// stale lists the releases, other than the current one, that still have
+	// a web container.
+	stale []int
+	// stopped lists the current release's containers that are not running.
+	stopped []string
+	// found reports whether the current release has a container at all,
+	// running whether one of them is running.
+	found, running bool
+}
+
+func classifyWebs(webs []runtime.Container, current int) webState {
+	var ws webState
+	seen := map[int]bool{}
+	for _, c := range webs {
+		switch {
+		case c.Release != current || current == 0:
+			if !seen[c.Release] {
+				seen[c.Release] = true
+				ws.stale = append(ws.stale, c.Release)
+			}
+		case c.Running:
+			ws.found, ws.running = true, true
+		default:
+			ws.found = true
+			ws.stopped = append(ws.stopped, c.ID)
+		}
+	}
+	return ws
+}
+
+// Reconcile makes the host match the recorded state: it points the proxy at
+// the current release, removes web containers of releases that are not
+// current, starts the current one if it is stopped and brings the other
+// services up. It is run at startup, so a crash at any point of a deploy
+// converges.
 func (e *Engine) Reconcile(ctx context.Context, app *appdef.App) error {
 	name := app.Name
 	if !e.tryLock(name) {
@@ -465,25 +549,26 @@ func (e *Engine) Reconcile(ctx context.Context, app *appdef.App) error {
 	if err != nil {
 		return err
 	}
-	var stopped []string
-	currentFound := false
-	for _, c := range webs {
-		switch {
-		case c.Release != st.Current || st.Current == 0:
-			if err := e.Runtime.RemoveWeb(ctx, name, c.Release); err != nil {
-				return err
-			}
-		case c.Running:
-			currentFound = true
-		default:
-			currentFound = true
-			stopped = append(stopped, c.ID)
+	ws := classifyWebs(webs, st.Current)
+	cur, ok := st.CurrentRelease()
+	// A crash between the proxy switch and the commit leaves the proxy on a
+	// release that was never recorded. Move traffic back to the recorded one
+	// before that container is removed; everything after this point can be
+	// slow, starting a database included.
+	if ok && ws.running {
+		if err := e.Proxy.Switch(ctx, name, app.Domains, cur.Port); err != nil {
+			return err
 		}
 	}
-	cur, ok := st.CurrentRelease()
+	for _, release := range ws.stale {
+		if err := e.Runtime.RemoveWeb(ctx, name, release); err != nil {
+			return err
+		}
+	}
 	if !ok {
 		return nil
 	}
+	stopped, currentFound := ws.stopped, ws.found
 	if err := e.ensureImage(ctx, name, cur.Digest, cur.Number); err != nil {
 		return err
 	}
@@ -521,17 +606,30 @@ type logWriter struct {
 
 func (w *logWriter) Write(p []byte) (int, error) {
 	w.buf.Write(p)
+	text := w.buf.String()
 	for {
-		text := w.buf.String()
 		i := strings.IndexByte(text, '\n')
+		if i < 0 && len(text) >= maxLogLine {
+			// No newline in sight: emit what there is so a command that
+			// never ends its line cannot grow the buffer without limit.
+			i = maxLogLine
+			w.emit(text[:i])
+			text = text[i:]
+			continue
+		}
 		if i < 0 {
 			break
 		}
-		w.buf.Reset()
-		w.buf.WriteString(text[i+1:])
-		if line := strings.TrimRight(text[:i], "\r"); line != "" {
-			w.sink(Event{Step: w.step, Status: "log", Release: w.release, Message: line})
-		}
+		w.emit(text[:i])
+		text = text[i+1:]
 	}
+	w.buf.Reset()
+	w.buf.WriteString(text)
 	return len(p), nil
+}
+
+func (w *logWriter) emit(line string) {
+	if line = strings.TrimRight(line, "\r"); line != "" {
+		w.sink(Event{Step: w.step, Status: "log", Release: w.release, Message: line})
+	}
 }

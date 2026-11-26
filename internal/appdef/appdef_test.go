@@ -1,8 +1,10 @@
 package appdef
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -134,73 +136,147 @@ func TestParseRejectsBadAppDefinitions(t *testing.T) {
 // escapeAttempts is the corpus of compose files that must never load. Each
 // one tries to reach the host, another app, or the Docker daemon.
 var escapeAttempts = map[string]string{
-	"privileged":            "services:\n  web:\n    image: ${IMAGE}\n    privileged: true\n",
-	"host network":          "services:\n  web:\n    image: ${IMAGE}\n    network_mode: host\n",
-	"host pid":              "services:\n  web:\n    image: ${IMAGE}\n    pid: host\n",
-	"host ipc":              "services:\n  web:\n    image: ${IMAGE}\n    ipc: host\n",
-	"host userns":           "services:\n  web:\n    image: ${IMAGE}\n    userns_mode: host\n",
-	"cap_add":               "services:\n  web:\n    image: ${IMAGE}\n    cap_add: [SYS_ADMIN]\n",
-	"devices":               "services:\n  web:\n    image: ${IMAGE}\n    devices: [\"/dev/sda:/dev/sda\"]\n",
-	"security_opt":          "services:\n  web:\n    image: ${IMAGE}\n    security_opt: [\"seccomp:unconfined\"]\n",
-	"docker socket":         "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"/var/run/docker.sock:/var/run/docker.sock\"]\n",
-	"host bind mount":       "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"/etc:/host-etc\"]\n",
-	"relative bind mount":   "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"./data:/data\"]\n",
-	"home bind mount":       "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"~/.ssh:/ssh\"]\n",
-	"long-form bind":        "services:\n  web:\n    image: ${IMAGE}\n    volumes:\n      - type: bind\n        source: /\n        target: /host\n",
-	"undeclared volume":     "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"data:/data\"]\n",
-	"volume with driver":    "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"data:/data\"]\nvolumes:\n  data:\n    driver_opts: { type: none, o: bind, device: / }\n",
-	"external volume":       "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"data:/data\"]\nvolumes:\n  data:\n    external: true\n",
-	"volume mode":           "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"data:/data:z\"]\nvolumes:\n  data:\n",
-	"volume relative path":  "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"data:data\"]\nvolumes:\n  data:\n",
-	"volumes_from":          "services:\n  web:\n    image: ${IMAGE}\n    volumes_from: [other]\n",
-	"build":                 "services:\n  web:\n    image: ${IMAGE}\n    build: .\n",
-	"published ports":       "services:\n  web:\n    image: ${IMAGE}\n    ports: [\"80:80\"]\n",
-	"other image":           "services:\n  web:\n    image: alpine\n",
-	"image with suffix":     "services:\n  web:\n    image: ${IMAGE}-debug\n",
-	"no image":              "services:\n  web:\n    command: [\"true\"]\n",
-	"second image":          "services:\n  web:\n    image: ${IMAGE}\n  side:\n    image: docker:dind\n",
-	"interpolated value":    "services:\n  web:\n    image: ${IMAGE}\n    command: [\"sh\", \"-c\", \"echo ${HOME}\"]\n",
-	"interpolated key":      "services:\n  web:\n    image: ${IMAGE}\n    environment:\n      ${KEY}: value\n",
-	"interpolated user":     "services:\n  web:\n    image: ${IMAGE}\n    user: ${UID}\n",
-	"root user":             "services:\n  web:\n    image: ${IMAGE}\n    user: root\n",
-	"uid zero":              "services:\n  web:\n    image: ${IMAGE}\n    user: \"0:0\"\n",
-	"numeric zero user":     "services:\n  web:\n    image: ${IMAGE}\n    user: 0\n",
-	"anchor":                "x: &a\n  privileged: true\nservices:\n  web:\n    image: ${IMAGE}\n",
-	"alias":                 "services:\n  web: &w\n    image: ${IMAGE}\n  other: *w\n",
-	"merge key":             "services:\n  web:\n    <<: { privileged: true }\n    image: ${IMAGE}\n",
-	"extends":               "services:\n  web:\n    image: ${IMAGE}\n    extends: { file: /etc/other.yml, service: x }\n",
-	"env_file":              "services:\n  web:\n    image: ${IMAGE}\n    env_file: [/etc/shadow]\n",
-	"networks":              "services:\n  web:\n    image: ${IMAGE}\n    networks: [other]\n",
-	"top-level networks":    "services:\n  web:\n    image: ${IMAGE}\nnetworks:\n  default: { external: true, name: zymple-other }\n",
-	"top-level include":     "include: [/etc/other.yml]\nservices:\n  web:\n    image: ${IMAGE}\n",
-	"top-level secrets":     "services:\n  web:\n    image: ${IMAGE}\nsecrets:\n  s: { file: /etc/shadow }\n",
-	"top-level name":        "name: zymple-other\nservices:\n  web:\n    image: ${IMAGE}\n",
-	"labels":                "services:\n  web:\n    image: ${IMAGE}\n    labels: { zymple.app: other }\n",
-	"container_name":        "services:\n  web:\n    image: ${IMAGE}\n    container_name: zymple-other-postgres\n",
-	"depends_on":            "services:\n  web:\n    image: ${IMAGE}\n    depends_on: [web]\n",
-	"sysctls":               "services:\n  web:\n    image: ${IMAGE}\n    sysctls: { net.ipv4.ip_forward: 1 }\n",
-	"cgroup_parent":         "services:\n  web:\n    image: ${IMAGE}\n    cgroup_parent: /\n",
-	"pull_policy":           "services:\n  web:\n    image: ${IMAGE}\n    pull_policy: always\n",
-	"extra_hosts":           "services:\n  web:\n    image: ${IMAGE}\n    extra_hosts: [\"postgres:1.2.3.4\"]\n",
-	"reserved env":          "services:\n  web:\n    image: ${IMAGE}\n    environment: { DATABASE_URL: postgres://elsewhere }\n",
-	"reserved env list":     "services:\n  web:\n    image: ${IMAGE}\n    environment: [\"REDIS_URL=redis://elsewhere\"]\n",
-	"env without value":     "services:\n  web:\n    image: ${IMAGE}\n    environment: { PASSTHROUGH: }\n",
-	"env list passthrough":  "services:\n  web:\n    image: ${IMAGE}\n    environment: [PASSTHROUGH]\n",
-	"env wrong type":        "services:\n  web:\n    image: ${IMAGE}\n    environment: 5\n",
-	"bad service name":      "services:\n  Web_Service!:\n    image: ${IMAGE}\n",
-	"service not a mapping": "services:\n  web: [1, 2]\n",
-	"services not mapping":  "services: [web]\n",
-	"volumes not mapping":   "services:\n  web:\n    image: ${IMAGE}\nvolumes: [data]\n",
-	"bad volume name":       "services:\n  web:\n    image: ${IMAGE}\nvolumes:\n  ../x:\n",
-	"service volumes map":   "services:\n  web:\n    image: ${IMAGE}\n    volumes: { a: b }\nvolumes:\n  a:\n",
-	"empty document":        "",
-	"not yaml":              "services: [unterminated",
+	"privileged":                         "services:\n  web:\n    image: ${IMAGE}\n    privileged: true\n",
+	"host network":                       "services:\n  web:\n    image: ${IMAGE}\n    network_mode: host\n",
+	"host pid":                           "services:\n  web:\n    image: ${IMAGE}\n    pid: host\n",
+	"host ipc":                           "services:\n  web:\n    image: ${IMAGE}\n    ipc: host\n",
+	"host userns":                        "services:\n  web:\n    image: ${IMAGE}\n    userns_mode: host\n",
+	"cap_add":                            "services:\n  web:\n    image: ${IMAGE}\n    cap_add: [SYS_ADMIN]\n",
+	"devices":                            "services:\n  web:\n    image: ${IMAGE}\n    devices: [\"/dev/sda:/dev/sda\"]\n",
+	"security_opt":                       "services:\n  web:\n    image: ${IMAGE}\n    security_opt: [\"seccomp:unconfined\"]\n",
+	"docker socket":                      "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"/var/run/docker.sock:/var/run/docker.sock\"]\n",
+	"host bind mount":                    "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"/etc:/host-etc\"]\n",
+	"relative bind mount":                "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"./data:/data\"]\n",
+	"home bind mount":                    "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"~/.ssh:/ssh\"]\n",
+	"long-form bind":                     "services:\n  web:\n    image: ${IMAGE}\n    volumes:\n      - type: bind\n        source: /\n        target: /host\n",
+	"undeclared volume":                  "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"data:/data\"]\n",
+	"volume with driver":                 "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"data:/data\"]\nvolumes:\n  data:\n    driver_opts: { type: none, o: bind, device: / }\n",
+	"external volume":                    "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"data:/data\"]\nvolumes:\n  data:\n    external: true\n",
+	"volume mode":                        "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"data:/data:z\"]\nvolumes:\n  data:\n",
+	"volume relative path":               "services:\n  web:\n    image: ${IMAGE}\n    volumes: [\"data:data\"]\nvolumes:\n  data:\n",
+	"volumes_from":                       "services:\n  web:\n    image: ${IMAGE}\n    volumes_from: [other]\n",
+	"build":                              "services:\n  web:\n    image: ${IMAGE}\n    build: .\n",
+	"published ports":                    "services:\n  web:\n    image: ${IMAGE}\n    ports: [\"80:80\"]\n",
+	"other image":                        "services:\n  web:\n    image: alpine\n",
+	"image with suffix":                  "services:\n  web:\n    image: ${IMAGE}-debug\n",
+	"no image":                           "services:\n  web:\n    command: [\"true\"]\n",
+	"second image":                       "services:\n  web:\n    image: ${IMAGE}\n  side:\n    image: docker:dind\n",
+	"interpolated value":                 "services:\n  web:\n    image: ${IMAGE}\n    command: [\"sh\", \"-c\", \"echo ${HOME}\"]\n",
+	"interpolated key":                   "services:\n  web:\n    image: ${IMAGE}\n    environment:\n      ${KEY}: value\n",
+	"interpolated user":                  "services:\n  web:\n    image: ${IMAGE}\n    user: ${UID}\n",
+	"root user":                          "services:\n  web:\n    image: ${IMAGE}\n    user: root\n",
+	"uid zero":                           "services:\n  web:\n    image: ${IMAGE}\n    user: \"0:0\"\n",
+	"numeric zero user":                  "services:\n  web:\n    image: ${IMAGE}\n    user: 0\n",
+	"anchor":                             "x: &a\n  privileged: true\nservices:\n  web:\n    image: ${IMAGE}\n",
+	"alias":                              "services:\n  web: &w\n    image: ${IMAGE}\n  other: *w\n",
+	"merge key":                          "services:\n  web:\n    <<: { privileged: true }\n    image: ${IMAGE}\n",
+	"extends":                            "services:\n  web:\n    image: ${IMAGE}\n    extends: { file: /etc/other.yml, service: x }\n",
+	"env_file":                           "services:\n  web:\n    image: ${IMAGE}\n    env_file: [/etc/shadow]\n",
+	"networks":                           "services:\n  web:\n    image: ${IMAGE}\n    networks: [other]\n",
+	"top-level networks":                 "services:\n  web:\n    image: ${IMAGE}\nnetworks:\n  default: { external: true, name: zymple-other }\n",
+	"top-level include":                  "include: [/etc/other.yml]\nservices:\n  web:\n    image: ${IMAGE}\n",
+	"top-level secrets":                  "services:\n  web:\n    image: ${IMAGE}\nsecrets:\n  s: { file: /etc/shadow }\n",
+	"top-level name":                     "name: zymple-other\nservices:\n  web:\n    image: ${IMAGE}\n",
+	"labels":                             "services:\n  web:\n    image: ${IMAGE}\n    labels: { zymple.app: other }\n",
+	"container_name":                     "services:\n  web:\n    image: ${IMAGE}\n    container_name: zymple-other-postgres\n",
+	"depends_on":                         "services:\n  web:\n    image: ${IMAGE}\n    depends_on: [web]\n",
+	"sysctls":                            "services:\n  web:\n    image: ${IMAGE}\n    sysctls: { net.ipv4.ip_forward: 1 }\n",
+	"cgroup_parent":                      "services:\n  web:\n    image: ${IMAGE}\n    cgroup_parent: /\n",
+	"pull_policy":                        "services:\n  web:\n    image: ${IMAGE}\n    pull_policy: always\n",
+	"extra_hosts":                        "services:\n  web:\n    image: ${IMAGE}\n    extra_hosts: [\"postgres:1.2.3.4\"]\n",
+	"reserved env":                       "services:\n  web:\n    image: ${IMAGE}\n    environment: { DATABASE_URL: postgres://elsewhere }\n",
+	"reserved env list":                  "services:\n  web:\n    image: ${IMAGE}\n    environment: [\"REDIS_URL=redis://elsewhere\"]\n",
+	"env without value":                  "services:\n  web:\n    image: ${IMAGE}\n    environment: { PASSTHROUGH: }\n",
+	"env list passthrough":               "services:\n  web:\n    image: ${IMAGE}\n    environment: [PASSTHROUGH]\n",
+	"env wrong type":                     "services:\n  web:\n    image: ${IMAGE}\n    environment: 5\n",
+	"bad service name":                   "services:\n  Web_Service!:\n    image: ${IMAGE}\n",
+	"service not a mapping":              "services:\n  web: [1, 2]\n",
+	"services not mapping":               "services: [web]\n",
+	"volumes not mapping":                "services:\n  web:\n    image: ${IMAGE}\nvolumes: [data]\n",
+	"bad volume name":                    "services:\n  web:\n    image: ${IMAGE}\nvolumes:\n  ../x:\n",
+	"service volumes map":                "services:\n  web:\n    image: ${IMAGE}\n    volumes: { a: b }\nvolumes:\n  a:\n",
+	"user double zero":                   "services:\n  web:\n    image: ${IMAGE}\n    user: \"00\"\n",
+	"user plus zero":                     "services:\n  web:\n    image: ${IMAGE}\n    user: \"+0\"\n",
+	"user double zero with group":        "services:\n  web:\n    image: ${IMAGE}\n    user: \"00:5\"\n",
+	"user hex zero":                      "services:\n  web:\n    image: ${IMAGE}\n    user: \"0x0\"\n",
+	"user space zero":                    "services:\n  web:\n    image: ${IMAGE}\n    user: \" 0\"\n",
+	"user zero trailing space":           "services:\n  web:\n    image: ${IMAGE}\n    user: \"0 \"\n",
+	"user zero zero":                     "services:\n  web:\n    image: ${IMAGE}\n    user: \"0:0\"\n",
+	"user root with gid":                 "services:\n  web:\n    image: ${IMAGE}\n    user: \"root:1\"\n",
+	"user minus zero":                    "services:\n  web:\n    image: ${IMAGE}\n    user: \"-0\"\n",
+	"user float zero string":             "services:\n  web:\n    image: ${IMAGE}\n    user: \"0.0\"\n",
+	"user float zero":                    "services:\n  web:\n    image: ${IMAGE}\n    user: 0.0\n",
+	"user int zero":                      "services:\n  web:\n    image: ${IMAGE}\n    user: 0\n",
+	"user yaml octal zero":               "services:\n  web:\n    image: ${IMAGE}\n    user: 00\n",
+	"user yaml hex zero":                 "services:\n  web:\n    image: ${IMAGE}\n    user: 0x0\n",
+	"user signed group":                  "services:\n  web:\n    image: ${IMAGE}\n    user: \"1000:+0\"\n",
+	"user padded group":                  "services:\n  web:\n    image: ${IMAGE}\n    user: \"1000:00\"\n",
+	"user empty":                         "services:\n  web:\n    image: ${IMAGE}\n    user: \"\"\n",
+	"user empty before group":            "services:\n  web:\n    image: ${IMAGE}\n    user: \":0\"\n",
+	"user empty group":                   "services:\n  web:\n    image: ${IMAGE}\n    user: \"1000:\"\n",
+	"user three parts":                   "services:\n  web:\n    image: ${IMAGE}\n    user: \"1000:1000:0\"\n",
+	"user uppercase root":                "services:\n  web:\n    image: ${IMAGE}\n    user: \"ROOT\"\n",
+	"user uid overflow":                  "services:\n  web:\n    image: ${IMAGE}\n    user: \"4294967296\"\n",
+	"user wraps to zero":                 "services:\n  web:\n    image: ${IMAGE}\n    user: 4294967296\n",
+	"user mapping":                       "services:\n  web:\n    image: ${IMAGE}\n    user: { name: root }\n",
+	"user list":                          "services:\n  web:\n    image: ${IMAGE}\n    user: [root]\n",
+	"user bool":                          "services:\n  web:\n    image: ${IMAGE}\n    user: true\n",
+	"user float":                         "services:\n  web:\n    image: ${IMAGE}\n    user: 1e3\n",
+	"non-string key hides interpolation": "services:\n  web:\n    image: ${IMAGE}\n    healthcheck:\n      1: x\n      test: [\"CMD\", \"${HOME}\"]\n",
+	"non-string key in a list":           "services:\n  web:\n    image: ${IMAGE}\n    command: [{ 1: x }]\n",
+	"empty document":                     "",
+	"not yaml":                           "services: [unterminated",
 }
 
 func TestComposeEscapeAttemptsAreRejected(t *testing.T) {
 	for name, compose := range escapeAttempts {
 		if c, err := ParseCompose([]byte(compose)); err == nil {
 			t.Errorf("%s: accepted: %+v", name, c)
+		}
+	}
+}
+
+func TestUserAllowList(t *testing.T) {
+	for _, user := range []string{`1000`, `"1000"`, `"1000:1000"`, `"1000:0"`, `nobody`, `"app:app"`, `"_svc:100"`, `"4294967295"`} {
+		if _, err := ParseCompose([]byte("services:\n  web:\n    image: ${IMAGE}\n    user: " + user + "\n")); err != nil {
+			t.Errorf("user %s was refused: %v", user, err)
+		}
+	}
+}
+
+// Regression: a service named like a release of the web service replaced the
+// web service in the rendered file, and one named like a managed service
+// shadowed its network alias.
+func TestReservedServiceNames(t *testing.T) {
+	const app = "name: shop\ndomains: [a.example.com]\nweb: { service: web, port: 80 }\n"
+	compose := func(name string) []byte {
+		return []byte("services:\n  web:\n    image: ${IMAGE}\n  " + name + ":\n    image: ${IMAGE}\n")
+	}
+	cases := []struct {
+		extra, service string
+		ok             bool
+	}{
+		{"", "web-r1", false},
+		{"", "web-r250", false},
+		{"", "web-r", true},
+		{"", "web-rx1", true},
+		{"", "worker-r1", true},
+		{"", "postgres", true},
+		{"", "redis", true},
+		{"postgres: { version: 17 }\n", "postgres", false},
+		{"postgres: { version: 17 }\n", "postgres-drill-x", false},
+		{"postgres: { version: 17 }\n", "postgres-exporter", true},
+		{"postgres: { version: 17 }\n", "redis", true},
+		{"redis: {}\n", "redis", false},
+		{"redis: {}\n", "redis-worker", true},
+	}
+	for _, c := range cases {
+		_, err := Parse([]byte(app+c.extra), compose(c.service))
+		if c.ok && err != nil {
+			t.Errorf("%q with %q was refused: %v", c.service, c.extra, err)
+		}
+		if !c.ok && (err == nil || !strings.Contains(err.Error(), "reserved")) {
+			t.Errorf("%q with %q: %v, want a reserved-name error", c.service, c.extra, err)
 		}
 	}
 }
@@ -378,6 +454,12 @@ func FuzzParseCompose(f *testing.F) {
 			for key := range svc {
 				if !allowedServiceKeys[key] {
 					t.Fatalf("service %s accepted with key %q", name, key)
+				}
+			}
+			if user, set := svc["user"]; set {
+				uid, _, _ := strings.Cut(fmt.Sprint(user), ":")
+				if n, err := strconv.Atoi(strings.TrimSpace(uid)); (err == nil && n == 0) || strings.TrimSpace(uid) == "root" {
+					t.Fatalf("service %s accepted with root user %q", name, user)
 				}
 			}
 			if vols, ok := svc["volumes"].([]any); ok {

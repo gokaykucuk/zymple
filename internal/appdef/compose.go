@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -17,6 +18,10 @@ const ImagePlaceholder = "${IMAGE}"
 var (
 	serviceRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
 	volumeRe  = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
+	// A numeric id is plain decimal: no sign, no leading zero, no other base.
+	// Docker reads "00" and "+0" as uid 0, so only one spelling is accepted.
+	numericIDRe = regexp.MustCompile(`^(0|[1-9][0-9]{0,9})$`)
+	accountRe   = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 )
 
 // allowedServiceKeys is an allow-list. Anything not named here is rejected,
@@ -165,6 +170,9 @@ func validateService(svc map[string]any, declaredVolumes map[string]bool) error 
 	if image, _ := svc["image"].(string); image != ImagePlaceholder {
 		return fmt.Errorf("image must be exactly %s", ImagePlaceholder)
 	}
+	if err := rejectNonStringKeys(svc); err != nil {
+		return err
+	}
 	if err := rejectInterpolation(svc, true); err != nil {
 		return err
 	}
@@ -175,6 +183,29 @@ func validateService(svc map[string]any, declaredVolumes map[string]bool) error 
 		return err
 	}
 	return validateServiceVolumes(svc["volumes"], declaredVolumes)
+}
+
+// rejectNonStringKeys refuses mappings with a key that is not a string. The
+// YAML decoder gives those a different Go type, which the checks below would
+// otherwise walk straight past.
+func rejectNonStringKeys(v any) error {
+	switch t := v.(type) {
+	case map[any]any:
+		return errors.New("mapping keys must be strings")
+	case map[string]any:
+		for _, val := range t {
+			if err := rejectNonStringKeys(val); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, val := range t {
+			if err := rejectNonStringKeys(val); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // rejectInterpolation refuses "$" anywhere except the image placeholder, so
@@ -207,15 +238,50 @@ func rejectInterpolation(v any, top bool) error {
 	return nil
 }
 
+// validateUser checks a service's user against an allow-list. The value is
+// USER[:GROUP]. Anything Docker could read as uid 0 in another spelling is
+// refused by accepting exactly one spelling of a number.
 func validateUser(raw any) error {
 	if raw == nil {
 		return nil
 	}
-	user := fmt.Sprint(raw)
-	if user == "0" || user == "root" || strings.HasPrefix(user, "0:") || strings.HasPrefix(user, "root:") {
-		return errors.New("user must not be root; omit it to use the image's user")
+	var value string
+	switch t := raw.(type) {
+	case string:
+		value = t
+	case int:
+		value = strconv.Itoa(t)
+	default:
+		return errors.New("user must be a string or a whole number")
+	}
+	user, group, hasGroup := strings.Cut(value, ":")
+	if !validUserPart(user) {
+		return errors.New("user must be a non-zero decimal uid or a lowercase account name other than root; omit it to use the image's user")
+	}
+	if hasGroup && !validGroupPart(group) {
+		return errors.New("the group of user must be a decimal gid or a lowercase group name")
 	}
 	return nil
+}
+
+func validUserPart(s string) bool {
+	if numericIDRe.MatchString(s) {
+		return validID(s) && s != "0"
+	}
+	return accountRe.MatchString(s) && s != "root"
+}
+
+func validGroupPart(s string) bool {
+	if numericIDRe.MatchString(s) {
+		return validID(s)
+	}
+	return accountRe.MatchString(s)
+}
+
+// validID reports whether a decimal string fits a 32-bit uid or gid.
+func validID(s string) bool {
+	n, err := strconv.ParseUint(s, 10, 32)
+	return err == nil && n <= 4294967295
 }
 
 func validateServiceVolumes(raw any, declared map[string]bool) error {

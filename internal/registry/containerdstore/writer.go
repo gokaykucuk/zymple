@@ -16,13 +16,16 @@ import (
 )
 
 // leaseExpiration bounds how long uploaded content survives without an image
-// referring to it, for example after an abandoned push.
-const leaseExpiration = time.Hour
+// referring to it, for example after an abandoned push. It has to outlast the
+// slowest push: the first layer's lease must still hold when the manifest
+// arrives.
+const leaseExpiration = 24 * time.Hour
 
 // blobWriter is a resumable upload into the containerd content store.
 type blobWriter struct {
-	reg *Registry
-	id  string
+	reg   *Registry
+	blobs *blobStore
+	id    string
 	// lease keeps the uploaded content from being garbage collected until an
 	// image refers to it. It is deliberately not deleted after a successful
 	// commit: the manifest that will reference the blob arrives later.
@@ -41,7 +44,8 @@ func newUploadID() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-func newBlobWriter(ctx context.Context, reg *Registry, id string) (*blobWriter, error) {
+func newBlobWriter(ctx context.Context, blobs *blobStore, id string) (*blobWriter, error) {
+	reg := blobs.reg
 	if id == "" {
 		var err error
 		if id, err = newUploadID(); err != nil {
@@ -65,7 +69,7 @@ func newBlobWriter(ctx context.Context, reg *Registry, id string) (*blobWriter, 
 		_ = manager.Delete(ctx, lease)
 		return nil, fmt.Errorf("read containerd content writer status: %w", err)
 	}
-	return &blobWriter{reg: reg, id: id, lease: lease, writer: writer, size: status.Offset}, nil
+	return &blobWriter{reg: reg, blobs: blobs, id: id, lease: lease, writer: writer, size: status.Offset}, nil
 }
 
 func (w *blobWriter) ID() string           { return w.id }
@@ -91,21 +95,34 @@ func (w *blobWriter) Write(data []byte) (int, error) {
 	return n, nil
 }
 
-// Commit finishes the upload. containerd verifies the digest.
+// Commit finishes the upload. containerd verifies the digest, so a
+// successful commit proves the client held the bytes; only then is the blob
+// recorded as belonging to the repository.
 func (w *blobWriter) Commit(ctx context.Context, desc v1.Descriptor) (v1.Descriptor, error) {
 	ctx = w.reg.ctx(ctx)
+	manager := w.reg.stores.LeasesService()
 	if err := w.writer.Commit(ctx, w.size, desc.Digest); err != nil {
-		// Nothing new was written, so the lease protects nothing.
-		_ = w.reg.stores.LeasesService().Delete(ctx, w.lease)
 		switch {
 		case errdefs.IsAlreadyExists(err):
+			// The host already had the content, perhaps only through an
+			// image that is about to be pruned. Hold it under this upload's
+			// lease until the manifest arrives.
+			resource := leases.Resource{ID: desc.Digest.String(), Type: "content"}
+			if err := manager.AddResource(ctx, w.lease, resource); err != nil {
+				return v1.Descriptor{}, fmt.Errorf("lease existing blob: %w", err)
+			}
 		case errdefs.IsFailedPrecondition(err), errdefs.IsInvalidArgument(err):
 			// The content does not match the digest or size the client
 			// claimed. That is the client's error, not the server's.
+			_ = manager.Delete(ctx, w.lease)
 			return v1.Descriptor{}, distribution.ErrBlobInvalidDigest{Digest: desc.Digest, Reason: err}
 		default:
+			_ = manager.Delete(ctx, w.lease)
 			return v1.Descriptor{}, fmt.Errorf("commit blob: %w", err)
 		}
+	}
+	if err := w.blobs.claim(ctx, desc.Digest); err != nil {
+		return v1.Descriptor{}, err
 	}
 	if desc.Size == 0 {
 		desc.Size = w.size

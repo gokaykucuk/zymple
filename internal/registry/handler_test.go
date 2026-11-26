@@ -302,3 +302,58 @@ func TestNewHandlerAndDialReportBadInput(t *testing.T) {
 		t.Errorf("missing stores were accepted: %v", err)
 	}
 }
+
+// Regression: app "other" could replay app "shop"'s manifest, or put its own
+// config on shop's layers, and get an image in its own repository without
+// ever holding the content.
+func TestOneAppCannotAdoptAnothersImage(t *testing.T) {
+	f := newRegistry(t)
+	ctx := namespaces.WithNamespace(context.Background(), testNamespace)
+	config, layer := []byte(`{"architecture":"amd64","os":"linux"}`), []byte("shop's private layer")
+	f.upload("shop", config, false)
+	layerDigest := f.upload("shop", layer, false)
+	manifest := ociManifest(config, layer)
+	if resp := f.do("shop", "PUT", "/v2/zymple/shop/manifests/v1", manifest, v1.MediaTypeImageManifest); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("shop's own push: %d", resp.StatusCode)
+	}
+
+	// The shared content store no longer answers for another app's blobs,
+	// so there is no existence or size oracle either.
+	if resp := f.do("other", "HEAD", "/v2/zymple/other/blobs/"+layerDigest.String(), nil, ""); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("HEAD of shop's layer through other: %d, want 404", resp.StatusCode)
+	}
+	if resp := f.do("other", "HEAD", "/v2/zymple/other/manifests/"+digest.FromBytes(manifest).String(), nil, ""); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("HEAD of shop's manifest through other: %d, want 404", resp.StatusCode)
+	}
+	if resp := f.do("other", "PUT", "/v2/zymple/other/manifests/stolen", manifest, v1.MediaTypeImageManifest); resp.StatusCode < 400 {
+		t.Errorf("replayed manifest: %d, want an error", resp.StatusCode)
+	}
+	evil := []byte(`{"architecture":"amd64","os":"linux","config":{"Entrypoint":["cat","/secret"]}}`)
+	f.upload("other", evil, false)
+	if resp := f.do("other", "PUT", "/v2/zymple/other/manifests/mixed", ociManifest(evil, layer), v1.MediaTypeImageManifest); resp.StatusCode < 400 {
+		t.Errorf("own config on shop's layer: %d, want an error", resp.StatusCode)
+	}
+	for _, tag := range []string{"stolen", "mixed"} {
+		if _, err := f.stores.ImageService().Get(ctx, "docker.io/zymple/other:"+tag); err == nil {
+			t.Errorf("image zymple/other:%s was created from shop's content", tag)
+		}
+	}
+
+	// Uploading the same bytes is fine: then the app really has the content.
+	f.upload("other", config, false)
+	f.upload("other", layer, false)
+	if resp := f.do("other", "PUT", "/v2/zymple/other/manifests/own", manifest, v1.MediaTypeImageManifest); resp.StatusCode != http.StatusCreated {
+		t.Errorf("push after uploading every blob: %d", resp.StatusCode)
+	}
+}
+
+// Regression: HEAD /manifests/<digest> read the named blob into memory even
+// when it was a multi-gigabyte layer.
+func TestManifestLookupDoesNotReadLayers(t *testing.T) {
+	f := newRegistry(t)
+	big := bytes.Repeat([]byte("0123456789abcdef"), (5<<20)/16)
+	dgst := f.upload("shop", big, false)
+	if resp := f.do("shop", "HEAD", "/v2/zymple/shop/manifests/"+dgst.String(), nil, ""); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("HEAD manifests/<layer digest>: %d, want 404", resp.StatusCode)
+	}
+}

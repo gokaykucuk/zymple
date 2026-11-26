@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -27,6 +28,7 @@ const (
 var (
 	nameRe   = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}[a-z0-9]$`)
 	domainRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	digitsRe = regexp.MustCompile(`^[0-9]+$`)
 	pathRe   = regexp.MustCompile(`^/[A-Za-z0-9/_.\-?=&%]*$`)
 )
 
@@ -121,8 +123,36 @@ func Parse(appYAML, composeYAML []byte) (*App, error) {
 	if _, ok := compose.Services[app.Web.Service]; !ok {
 		return nil, fmt.Errorf("app.yml: web.service %q is not a service in the compose file", app.Web.Service)
 	}
+	if err := app.checkServiceNames(compose); err != nil {
+		return nil, fmt.Errorf("compose: %w", err)
+	}
 	app.Compose = compose
 	return &app, nil
+}
+
+// checkServiceNames refuses compose service names that Zymple needs for
+// itself: the per-release name of the web service, and the network aliases
+// of the managed Postgres and Redis containers.
+func (a *App) checkServiceNames(compose *Compose) error {
+	for _, name := range compose.ServiceNames() {
+		if reason := a.reservedService(name); reason != "" {
+			return fmt.Errorf("service name %q is reserved: %s", name, reason)
+		}
+	}
+	return nil
+}
+
+func (a *App) reservedService(name string) string {
+	if rest, ok := strings.CutPrefix(name, a.Web.Service+"-r"); ok && digitsRe.MatchString(rest) {
+		return "it is the name of a release of the web service"
+	}
+	if a.Postgres != nil && (name == "postgres" || strings.HasPrefix(name, "postgres-drill-")) {
+		return "it is how the app reaches its managed Postgres"
+	}
+	if a.Redis != nil && name == "redis" {
+		return "it is how the app reaches its managed Redis"
+	}
+	return ""
 }
 
 func (a *App) applyDefaults() {

@@ -68,12 +68,13 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Server, er
 		return nil, err
 	}
 	s := &Server{
-		Config:   cfg,
-		Log:      log,
-		Store:    &releases.Store{Root: cfg.StateDir},
-		Docker:   &runtime.Docker{Runner: runner, StateDir: cfg.StateDir},
-		Proxy:    &proxy.Caddy{Dir: cfg.Caddy.SnippetsDir, Reload: cfg.Caddy.Reload, TLS: cfg.Caddy.TLS, Runner: runner},
-		Postgres: &services.Postgres{Runner: runner, Config: cfg, Sleep: deploy.SleepContext, Now: time.Now},
+		Config: cfg,
+		Log:    log,
+		Store:  &releases.Store{Root: cfg.StateDir},
+		Docker: &runtime.Docker{Runner: runner, StateDir: cfg.StateDir},
+		Proxy:  &proxy.Caddy{Dir: cfg.Caddy.SnippetsDir, Reload: cfg.Caddy.Reload, TLS: cfg.Caddy.TLS, Runner: runner},
+		Postgres: &services.Postgres{Runner: runner, Config: cfg, Sleep: deploy.SleepContext, Now: time.Now,
+			Warn: func(msg string) { log.Warn(msg) }},
 		Redis:    &services.Redis{Runner: runner, Config: cfg},
 		Registry: reg,
 	}
@@ -147,12 +148,21 @@ func (s *Server) Reload(ctx context.Context) error {
 
 // load reads the definitions and tokens from disk. It returns the names of
 // apps whose definition disappeared.
+//
+// An app that is already loaded keeps its previous definition when the new
+// one cannot be used: a typo in app.yml must not take a running app down.
+// Only an app whose directory is gone counts as removed.
 func (s *Server) load() ([]string, error) {
-	apps, loadErr := appdef.LoadAll(s.Config.AppsDir)
-	if apps == nil {
+	loaded, loadErr := appdef.LoadAll(s.Config.AppsDir)
+	if loaded == nil {
 		return nil, loadErr
 	}
-	errs := []error{loadErr}
+	s.mu.RLock()
+	previous := s.apps
+	s.mu.RUnlock()
+
+	apps, keepErrs := keepPrevious(previous, loaded, s.Config.AppsDir)
+	errs := append([]error{loadErr}, keepErrs...)
 	tokens := make(map[string]auth.Set, len(apps))
 	for name, app := range apps {
 		set, err := auth.Load(app.TokensFile())
@@ -163,19 +173,10 @@ func (s *Server) load() ([]string, error) {
 	}
 
 	s.mu.Lock()
-	previous := s.apps
 	s.apps, s.tokens = apps, tokens
 	s.mu.Unlock()
 
-	if ports, ok := s.Engine.Ports.(*deploy.PortRange); ok {
-		for name := range apps {
-			if st, err := s.Store.Load(name); err == nil {
-				for _, r := range st.Releases {
-					ports.Reserve(r.Port)
-				}
-			}
-		}
-	}
+	s.reservePorts(apps)
 	var removed []string
 	for name := range previous {
 		if _, still := apps[name]; !still {
@@ -184,6 +185,94 @@ func (s *Server) load() ([]string, error) {
 	}
 	sort.Strings(removed)
 	return removed, errors.Join(errs...)
+}
+
+// reservePorts marks the ports of recorded releases as in use.
+func (s *Server) reservePorts(apps map[string]*appdef.App) {
+	ports, ok := s.Engine.Ports.(*deploy.PortRange)
+	if !ok {
+		return
+	}
+	for name := range apps {
+		st, err := s.Store.Load(name)
+		if err != nil {
+			continue
+		}
+		for _, r := range st.Releases {
+			ports.Reserve(r.Port)
+		}
+	}
+}
+
+// keepPrevious merges freshly loaded definitions with the ones already in
+// use. A previously loaded app that is missing from loaded, but whose
+// directory still exists, failed to load and keeps its previous definition.
+// A new definition may then claim a domain that such a kept definition still
+// serves; the definition in use wins, and the new one is put back to its own
+// previous definition, or left out if the app is new.
+func keepPrevious(previous, loaded map[string]*appdef.App, appsDir string) (map[string]*appdef.App, []error) {
+	apps := make(map[string]*appdef.App, len(loaded)+len(previous))
+	for name, app := range loaded {
+		apps[name] = app
+	}
+	kept := map[string]bool{}
+	for name, old := range previous {
+		if _, ok := apps[name]; !ok && isDir(filepath.Join(appsDir, name)) {
+			apps[name] = old
+			kept[name] = true
+		}
+	}
+	var errs []error
+	// Each pass moves at least one app from its new definition to its
+	// previous one, and the previous definitions never conflicted with each
+	// other, so this ends.
+	for len(kept) > 0 {
+		name, owner := newDefinitionInConflict(apps, kept)
+		if name == "" {
+			break
+		}
+		if old, had := previous[name]; had {
+			apps[name] = old
+			kept[name] = true
+			errs = append(errs, fmt.Errorf("app %s: a domain is still served by app %s; keeping the previous definition", name, owner))
+			continue
+		}
+		delete(apps, name)
+		errs = append(errs, fmt.Errorf("app %s: a domain is still served by app %s; not loaded", name, owner))
+	}
+	return apps, errs
+}
+
+// newDefinitionInConflict finds an app with a new definition that claims a
+// domain of a kept definition. Names are visited in sorted order so the
+// result does not depend on map iteration.
+func newDefinitionInConflict(apps map[string]*appdef.App, kept map[string]bool) (name, owner string) {
+	owners := map[string]string{}
+	for keptName := range kept {
+		for _, d := range apps[keptName].Domains {
+			owners[d] = keptName
+		}
+	}
+	names := make([]string, 0, len(apps))
+	for n := range apps {
+		if !kept[n] {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		for _, d := range apps[n].Domains {
+			if o, ok := owners[d]; ok {
+				return n, o
+			}
+		}
+	}
+	return "", ""
+}
+
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 // converge makes the host match the loaded definitions.

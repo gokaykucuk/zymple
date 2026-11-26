@@ -30,5 +30,7 @@ ports: { low: 20000, high: 29999 }  # loopback ports for web containers
 #     path_style: true
 
 # postgres_images: { 17: ghcr.io/gokaykucuk/zymple-postgres:17 }
-# redis_image: redis:7-alpine
-# restic_image: restic/restic:0.17.3
+# The defaults for these two are pinned by digest in the binary. Override
+# them to move to a newer version before a Zymple release does.
+# redis_image: redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
+# restic_image: restic/restic:0.17.3@sha256:8f5a62b422a2cb1277ea0dd6e826fe1acf649e5b9f02d60e5268d5fd1976255a

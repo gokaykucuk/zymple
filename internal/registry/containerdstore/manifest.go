@@ -47,7 +47,8 @@ func (m *manifestService) Get(ctx context.Context, dgst digest.Digest, _ ...dist
 // Put verifies a manifest and stores it. Verification matters because the
 // next step turns the manifest into an image: one that is malformed, or that
 // points at blobs which were never uploaded, would be an image that cannot
-// run.
+// run, and one that points at blobs another app uploaded would hand that
+// app's content to this one.
 func (m *manifestService) Put(ctx context.Context, manifest distribution.Manifest, _ ...distribution.ManifestServiceOption) (digest.Digest, error) {
 	mediaType, payload, err := manifest.Payload()
 	if err != nil {
@@ -74,21 +75,32 @@ func (m *manifestService) verify(ctx context.Context, manifest distribution.Mani
 	if len(refs) == 0 {
 		return errcode.ErrorCodeManifestInvalid.WithDetail("the manifest references no content")
 	}
+	// Hold the referenced content while it is checked and until the tag that
+	// follows makes it an image, so that pruning an older image at the same
+	// moment cannot take a shared layer away in between.
+	release, err := m.blobs.hold(ctx, refs)
+	if err != nil {
+		return err
+	}
 	var missing distribution.ErrManifestVerification
 	for _, ref := range refs {
 		if err := ref.Digest.Validate(); err != nil {
 			missing = append(missing, distribution.ErrManifestBlobUnknown{Digest: ref.Digest})
 			continue
 		}
+		// Stat only knows blobs that were pushed to this repository, so a
+		// manifest cannot adopt content that belongs to another app.
 		_, err := m.blobs.Stat(ctx, ref.Digest)
 		switch {
 		case errors.Is(err, distribution.ErrBlobUnknown):
 			missing = append(missing, distribution.ErrManifestBlobUnknown{Digest: ref.Digest})
 		case err != nil:
+			release()
 			return err
 		}
 	}
 	if len(missing) > 0 {
+		release()
 		return missing
 	}
 	return nil

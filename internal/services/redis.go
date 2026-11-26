@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -41,10 +42,8 @@ func (r *Redis) Ensure(ctx context.Context, app *appdef.App) (string, error) {
 	if state == "running" && have == want {
 		return RedisURL, nil
 	}
-	if state != "" {
-		if _, err := execx.Output(ctx, r.Runner, "docker", "rm", "-f", name); err != nil {
-			return "", err
-		}
+	if err := replace(ctx, r.Runner, name, state, redisStopSeconds); err != nil {
+		return "", err
 	}
 	args := []string{"run", "-d", "--name", name, "--restart", "unless-stopped",
 		"--network", appdef.Network(app.Name), "--network-alias", "redis",
@@ -65,33 +64,37 @@ func (r *Redis) Ensure(ctx context.Context, app *appdef.App) (string, error) {
 	return RedisURL, nil
 }
 
-func (r *Redis) restic(app string, readOnly bool, args ...string) ([]string, error) {
+// restic builds a restic invocation: the docker arguments, and the docker
+// CLI environment that carries the secrets named by the `-e NAME` flags.
+func (r *Redis) restic(app string, readOnly bool, args ...string) (argv, env []string, err error) {
 	b := r.Config.Backup
 	if b == nil {
-		return nil, errors.New("no backup repository is configured")
+		return nil, nil, errors.New("no backup repository is configured")
 	}
 	if b.CipherPass == "" {
-		return nil, errors.New("backup.cipher_pass is required for Redis backups")
+		return nil, nil, errors.New("backup.cipher_pass is required for Redis backups")
 	}
 	data := r.dir(app) + ":/data"
 	if readOnly {
 		data += ":ro"
 	}
-	run := []string{"run", "--rm", "-v", data, "-e", "RESTIC_PASSWORD=" + b.CipherPass, "--hostname", "zymple-" + app}
+	secrets := []string{"RESTIC_PASSWORD=" + b.CipherPass}
+	run := []string{"run", "--rm", "-v", data, "-e", "RESTIC_PASSWORD", "--hostname", "zymple-" + app}
 	if b.Type == "posix" {
 		repo := filepath.Join(b.Path, app, "redis")
 		if err := os.MkdirAll(repo, 0o750); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		run = append(run, "-v", repo+":/repo", "-e", "RESTIC_REPOSITORY=/repo")
 	} else {
 		repo := "s3:https://" + b.S3.Endpoint + "/" + b.S3.Bucket + filepath.Join("/", b.Path, app, "redis")
+		secrets = append(secrets, "AWS_ACCESS_KEY_ID="+b.S3.AccessKey, "AWS_SECRET_ACCESS_KEY="+b.S3.SecretKey)
 		run = append(run, "-e", "RESTIC_REPOSITORY="+repo,
-			"-e", "AWS_ACCESS_KEY_ID="+b.S3.AccessKey, "-e", "AWS_SECRET_ACCESS_KEY="+b.S3.SecretKey,
+			"-e", "AWS_ACCESS_KEY_ID", "-e", "AWS_SECRET_ACCESS_KEY",
 			"-e", "AWS_DEFAULT_REGION="+b.S3.Region)
 	}
 	run = append(run, r.Config.ResticImage)
-	return append(run, args...), nil
+	return append(run, args...), secretEnv(secrets...), nil
 }
 
 // Backup snapshots a persistent Redis data directory into the repository.
@@ -99,37 +102,41 @@ func (r *Redis) Backup(ctx context.Context, app *appdef.App, out io.Writer) erro
 	if app.Redis == nil || !app.Redis.Persistent {
 		return errors.New("this app has no persistent Redis")
 	}
-	check, err := r.restic(app.Name, true, "cat", "config")
+	check, env, err := r.restic(app.Name, true, "cat", "config")
 	if err != nil {
 		return err
 	}
-	if _, err := execx.Output(ctx, r.Runner, "docker", check...); err != nil {
-		init, _ := r.restic(app.Name, true, "init")
-		if err := execx.Stream(ctx, r.Runner, out, "docker", init...); err != nil {
+	if _, err := dockerOutput(ctx, r.Runner, env, nil, check...); err != nil {
+		init, _, _ := r.restic(app.Name, true, "init")
+		if err := dockerStream(ctx, r.Runner, out, env, init...); err != nil {
 			return err
 		}
 	}
-	backup, _ := r.restic(app.Name, true, "backup", "/data")
-	return execx.Stream(ctx, r.Runner, out, "docker", backup...)
+	backup, _, _ := r.restic(app.Name, true, "backup", "/data")
+	return dockerStream(ctx, r.Runner, out, env, backup...)
 }
 
 // Restore replaces a persistent Redis data directory with the latest
-// snapshot. Redis is stopped for the duration.
+// snapshot. Redis is stopped for the duration and started again whatever the
+// outcome: a failed restore must not also leave the app without Redis.
 func (r *Redis) Restore(ctx context.Context, app *appdef.App, out io.Writer) error {
 	if app.Redis == nil || !app.Redis.Persistent {
 		return errors.New("this app has no persistent Redis")
 	}
-	restore, err := r.restic(app.Name, false, "restore", "latest", "--target", "/", "--delete")
+	// restic refuses "--target / --delete" without a filter, because it would
+	// delete everything else under the target. The snapshot holds /data only.
+	restore, env, err := r.restic(app.Name, false, "restore", "latest", "--target", "/", "--delete", "--include", "/data")
 	if err != nil {
 		return err
 	}
 	name := RedisContainer(app.Name)
-	if _, err := execx.Output(ctx, r.Runner, "docker", "stop", name); err != nil {
+	if _, err := execx.Output(ctx, r.Runner, "docker", "stop", "--time", redisStopSeconds, name); err != nil {
 		return err
 	}
-	if err := execx.Stream(ctx, r.Runner, out, "docker", restore...); err != nil {
-		return err
+	restoreErr := dockerStream(ctx, r.Runner, out, env, restore...)
+	if restoreErr != nil {
+		fmt.Fprintf(out, "restore failed; starting Redis again on the data that is there\n")
 	}
-	_, err = execx.Output(ctx, r.Runner, "docker", "start", name)
-	return err
+	_, startErr := execx.Output(context.WithoutCancel(ctx), r.Runner, "docker", "start", name)
+	return errors.Join(restoreErr, startErr)
 }

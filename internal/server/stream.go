@@ -8,6 +8,16 @@ import (
 	"github.com/gokaykucuk/zymple/internal/deploy"
 )
 
+const (
+	// maxBacklog bounds the events a stream holds for a reader that is slow
+	// or gone. Beyond it the oldest are dropped; the outcome always arrives
+	// last, so it is never the one dropped.
+	maxBacklog = 10000
+	// maxLine bounds one log event. Output with no newline is cut into
+	// events of this size instead of growing a buffer without limit.
+	maxLine = 64 << 10
+)
+
 // stream buffers the events of one operation so that the operation never
 // blocks on, or dies with, the client that started it.
 type stream struct {
@@ -29,6 +39,10 @@ func (s *stream) add(e deploy.Event) {
 		return
 	}
 	s.events = append(s.events, e)
+	if over := len(s.events) - maxBacklog; over > 0 {
+		s.events = append([]deploy.Event(nil), s.events[over:]...)
+		s.dropped += over
+	}
 	close(s.wake)
 	s.wake = make(chan struct{})
 }
@@ -46,14 +60,26 @@ func (s *stream) close() {
 // from returns the events at index i and later, whether the stream has
 // ended, and a channel that is closed when there is more to read.
 func (s *stream) from(i int) ([]deploy.Event, bool, <-chan struct{}) {
+	events, _, closed, wake := s.read(i)
+	return events, closed, wake
+}
+
+// read is from, and also returns the index to ask for next. That is not
+// always i plus the number of events: a reader that fell behind skips the
+// events dropped in the meantime.
+func (s *stream) read(i int) ([]deploy.Event, int, bool, <-chan struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	start := i - s.dropped
 	if start < 0 {
-		// The caller asked for events that were already released.
+		// The caller asked for events that were already released or dropped.
 		start = 0
 	}
-	return s.events[start:], s.closed, s.wake
+	if start > len(s.events) {
+		start = len(s.events)
+	}
+	events := s.events[start:]
+	return events, s.dropped + start + len(events), s.closed, s.wake
 }
 
 // release forgets the events before index i. Each stream has one reader.
@@ -79,12 +105,21 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 	w.buf = append(w.buf, p...)
 	for {
 		i := indexByte(w.buf, '\n')
-		if i < 0 {
-			break
+		next := i + 1
+		if i < 0 || i > maxLine {
+			if len(w.buf) < maxLine {
+				break
+			}
+			// No line end within the limit: emit what there is.
+			i, next = maxLine, maxLine
 		}
 		line := string(w.buf[:i])
-		w.buf = w.buf[i+1:]
+		w.buf = w.buf[next:]
 		w.stream.add(deploy.Event{Step: w.step, Status: "log", Message: line})
+	}
+	if len(w.buf) == 0 {
+		// Do not keep a large backing array alive for a small remainder.
+		w.buf = nil
 	}
 	return len(p), nil
 }
@@ -116,13 +151,13 @@ func (s *stream) serve(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	sent := 0
 	for {
-		events, closed, wake := s.from(sent)
+		events, next, closed, wake := s.read(sent)
 		for _, e := range events {
 			if err := enc.Encode(e); err != nil {
 				return
 			}
 		}
-		sent += len(events)
+		sent = next
 		s.release(sent)
 		if flusher != nil {
 			flusher.Flush()

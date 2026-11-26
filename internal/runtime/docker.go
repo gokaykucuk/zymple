@@ -17,8 +17,13 @@ import (
 
 const (
 	composeServiceLabel = "com.docker.compose.service"
-	flagFormat          = "--format"
-	flagNoDeps          = "--no-deps"
+	// composeOneOffLabel is "True" on containers started by `compose run`
+	// and "False" on a service's own containers.
+	composeOneOffLabel = "com.docker.compose.oneoff"
+	flagFormat         = "--format"
+	flagNoDeps         = "--no-deps"
+	// noValue is what docker prints for a tag or digest an image lacks.
+	noValue = "<none>"
 )
 
 // Docker implements the container operations the deploy engine needs.
@@ -123,13 +128,28 @@ func (d *Docker) StartWeb(ctx context.Context, app *appdef.App, release int, out
 	return d.run(ctx, out, args)
 }
 
-// Containers lists an app's containers with the given role.
+// Containers lists an app's service containers with the given role.
+//
+// One-off containers are left out. `compose run` gives them the labels of
+// the service they were started from, so the release command and
+// `zymple run` would otherwise be mistaken for the web container itself.
 func (d *Docker) Containers(ctx context.Context, app, role string) ([]Container, error) {
+	return d.list(ctx, app, role, false)
+}
+
+// labelFilter is the `docker ps` flag that keeps containers with a label.
+func labelFilter(key, value string) []string {
+	return []string{"--filter", "label=" + key + "=" + value}
+}
+
+func (d *Docker) list(ctx context.Context, app, role string, oneOffs bool) ([]Container, error) {
 	format := fmt.Sprintf(`{{.ID}} {{.State}} {{.Label %q}} {{.Label %q}}`, appdef.LabelRelease, composeServiceLabel)
-	out, err := execx.Output(ctx, d.Runner, "docker", "ps", "-a",
-		"--filter", "label="+appdef.LabelApp+"="+app,
-		"--filter", "label="+appdef.LabelRole+"="+role,
-		flagFormat, format)
+	args := append([]string{"ps", "-a"}, labelFilter(appdef.LabelApp, app)...)
+	args = append(args, labelFilter(appdef.LabelRole, role)...)
+	if !oneOffs {
+		args = append(args, labelFilter(composeOneOffLabel, "False")...)
+	}
+	out, err := execx.Output(ctx, d.Runner, "docker", append(args, flagFormat, format)...)
 	if err != nil {
 		return nil, err
 	}
@@ -228,20 +248,22 @@ func (d *Docker) UpServices(ctx context.Context, app *appdef.App, release int, o
 	return d.run(ctx, out, args)
 }
 
-// StopAll stops every container of the app, web and services.
+// StopAll stops every container of the app: web, services, and one-off
+// commands that are still running.
 func (d *Docker) StopAll(ctx context.Context, app string) error {
-	return d.eachContainer(ctx, app, "stop")
+	return d.eachContainer(ctx, app, "stop", true)
 }
 
-// StartAll starts every container of the app again.
+// StartAll starts the app's web and service containers again. A one-off
+// command that was stopped is not run a second time.
 func (d *Docker) StartAll(ctx context.Context, app string) error {
-	return d.eachContainer(ctx, app, "start")
+	return d.eachContainer(ctx, app, "start", false)
 }
 
-func (d *Docker) eachContainer(ctx context.Context, app, verb string) error {
+func (d *Docker) eachContainer(ctx context.Context, app, verb string, oneOffs bool) error {
 	var ids []string
 	for _, role := range []string{appdef.RoleService, appdef.RoleWeb} {
-		list, err := d.Containers(ctx, app, role)
+		list, err := d.list(ctx, app, role, oneOffs)
 		if err != nil {
 			return err
 		}
@@ -256,8 +278,11 @@ func (d *Docker) eachContainer(ctx context.Context, app, verb string) error {
 	return err
 }
 
+// ReleaseTagPrefix starts every tag Zymple itself puts on an image.
+const ReleaseTagPrefix = "release-"
+
 // ReleaseTag is the local tag that pins a release's image against pruning.
-func ReleaseTag(release int) string { return "release-" + strconv.Itoa(release) }
+func ReleaseTag(release int) string { return ReleaseTagPrefix + strconv.Itoa(release) }
 
 // Pin tags a release's image so image pruning cannot remove it.
 func (d *Docker) Pin(ctx context.Context, app, digest string, release int) error {
@@ -275,17 +300,31 @@ func (d *Docker) Repin(ctx context.Context, app, digest string, release int) err
 	return err
 }
 
+// Tag is one tag in an app's repository and the digest it points at.
+type Tag struct {
+	Name string
+	// Digest is "" when Docker does not report one.
+	Digest string
+}
+
 // Tags lists the tags in an app's repository.
-func (d *Docker) Tags(ctx context.Context, app string) ([]string, error) {
-	out, err := execx.Output(ctx, d.Runner, "docker", "images", flagFormat, "{{.Tag}}", appdef.Repository(app))
+func (d *Docker) Tags(ctx context.Context, app string) ([]Tag, error) {
+	out, err := execx.Output(ctx, d.Runner, "docker", "images", "--digests",
+		flagFormat, "{{.Tag}} {{.Digest}}", appdef.Repository(app))
 	if err != nil {
 		return nil, err
 	}
-	var tags []string
-	for _, tag := range strings.Fields(out) {
-		if tag != "<none>" {
-			tags = append(tags, tag)
+	var tags []Tag
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] == noValue {
+			continue
 		}
+		tag := Tag{Name: fields[0]}
+		if len(fields) > 1 && fields[1] != noValue {
+			tag.Digest = fields[1]
+		}
+		tags = append(tags, tag)
 	}
 	return tags, nil
 }

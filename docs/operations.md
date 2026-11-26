@@ -22,7 +22,13 @@ files are in [`deploy/`](../deploy).
 
 ## Install
 
-1. Put the release binary at `/usr/local/bin/zymple`.
+1. Put the release binary at `/usr/local/bin/zymple`. Check it first: each
+   release carries `SHA256SUMS` and a signed build provenance attestation.
+
+   ```bash
+   gh attestation verify zymple-linux-amd64 -R gokaykucuk/zymple
+   ```
+
 2. Copy `deploy/zymple.service` to `/etc/systemd/system/`.
 3. Write `/etc/zymple/zymple.yml`, mode 0600. Every key is optional; see
    `deploy/zymple.yml.example`. Set `containerd.socket` to the socket your
@@ -151,6 +157,18 @@ zymple pg restore myapp --yes --time "2026-01-02 15:04:05+00"
 ```
 
 Omit `--time` to restore to the latest archived state.
+
+## Upgrading from a release before the hardening changes
+
+- The first push of each app uploads every layer again. Blob ownership is
+  now recorded per app and older images carry no record.
+- With backups configured, each Postgres container is replaced once, with a
+  clean shutdown, on the next deploy or reload: expect a short database
+  restart. Redis containers are replaced once too, because the default image
+  is now pinned by digest.
+- Existing clusters keep `app` as a superuser and log a warning. See the
+  spec's Postgres section for how to get the split.
+- Replace the unit file: it now sets `KillMode=mixed`.
 
 ## Rebuilding a host
 
