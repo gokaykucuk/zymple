@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -46,6 +47,7 @@ On the host (uses the operator socket):
   redeploy <app>                 new release of the current image
   run <app> -- <command...>      run a command in a one-off container
   pg info|backup|restore|psql|drill-rm <app>
+  pg import <app> <dump-file> --yes   replace the database with a pg_dump archive
   redis backup|restore <app>
 
 Anywhere:
@@ -453,7 +455,7 @@ func cmdRun(ctx context.Context, args []string, env Env) error {
 
 func cmdPG(ctx context.Context, args []string, env Env) error {
 	if len(args) < 2 {
-		return usagef("usage: zymple pg info|backup|restore|psql|drill-rm <app>")
+		return usagef("usage: zymple pg info|backup|restore|import|psql|drill-rm <app>")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -492,6 +494,8 @@ func cmdPG(ctx context.Context, args []string, env Env) error {
 			return usagef("an in-place restore stops %s and replaces its database; pass --yes to confirm, or --into <name> for a drill", app)
 		}
 		return adminStream(ctx, env, http.MethodPost, adminApps+app+"/pg/restore", map[string]string{"time": *at, "into": *into})
+	case "import":
+		return cmdPGImport(ctx, rest, env)
 	case "drill-rm":
 		if len(rest) != 2 {
 			return usagef("usage: zymple pg drill-rm <app> <name>")
@@ -513,6 +517,35 @@ func cmdPG(ctx context.Context, args []string, env Env) error {
 		})
 	}
 	return usagef("unknown pg command %q", sub)
+}
+
+// cmdPGImport replaces an app's database with a pg_dump archive.
+func cmdPGImport(ctx context.Context, args []string, env Env) error {
+	fs := newFlags("pg import", env)
+	yes := fs.Bool("yes", false, "")
+	jobs := fs.Int("jobs", 0, "")
+	noStart := fs.Bool("no-start", false, "")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 2 {
+		return usagef("usage: zymple pg import <app> <dump-file> --yes [--jobs n] [--no-start]")
+	}
+	app, err := appName(pos[0])
+	if err != nil {
+		return err
+	}
+	if !*yes {
+		return usagef("an import stops %s and replaces its whole database with the dump; pass --yes to confirm", app)
+	}
+	// The daemon reads the file, so it needs a path that means the same there.
+	file, err := filepath.Abs(pos[1])
+	if err != nil {
+		return err
+	}
+	body := map[string]any{"file": file, "jobs": *jobs, "no_start": *noStart}
+	return adminStream(ctx, env, http.MethodPost, adminApps+app+"/pg/import", body)
 }
 
 func cmdRedis(ctx context.Context, args []string, env Env) error {
