@@ -24,6 +24,7 @@ var (
 	ErrBusy          = errors.New("a deploy is already in progress for this app")
 	ErrUnknownDigest = errors.New("no image with that digest has been pushed for this app")
 	ErrNoRelease     = errors.New("no such release")
+	ErrUnknownImage  = errors.New("the app declares no image of that name")
 	ErrImageGone     = errors.New("the image of that release is no longer on this host (`docker image prune -a` removes kept releases); push it again")
 )
 
@@ -46,8 +47,10 @@ type Runtime interface {
 	Containers(ctx context.Context, app, role string) ([]runtime.Container, error)
 	StartContainers(ctx context.Context, ids []string) error
 	UpServices(ctx context.Context, app *appdef.App, release int, out io.Writer) error
-	Pin(ctx context.Context, app, digest string, release int) error
-	Repin(ctx context.Context, app, digest string, release int) error
+	// Pin and Repin take the name of the image within the release: "" for
+	// the app's own image, otherwise one of its extra images.
+	Pin(ctx context.Context, app, digest string, release int, image string) error
+	Repin(ctx context.Context, app, digest string, release int, image string) error
 	// RemoveOneOffs force-removes the app's one-off containers (the release
 	// command, `zymple run`) of the releases match selects.
 	RemoveOneOffs(ctx context.Context, app string, match func(release int) bool) error
@@ -181,21 +184,115 @@ func (e *Engine) Lock(app string) (unlock func(), err error) {
 
 // request describes one run of the state machine.
 type request struct {
-	app            *appdef.App
+	app *appdef.App
+	// digest is the app's own image, images its extra images by name.
 	digest         string
+	images         map[string]string
 	by             string
 	skipRelease    bool
 	rolledBackFrom int
-	// fromRelease is the recorded release the digest was taken from, 0 when
-	// the digest came from the caller. Only a recorded digest may be
-	// re-pinned by image id: doing that for a caller's digest would let one
-	// app deploy an image that was only ever pushed to another app.
-	fromRelease int
+	// from is, per image name ("" for the app's own), the recorded release
+	// its digest was taken from. An image the caller gave is not in it. Only
+	// a recorded digest may be re-pinned by image id: doing that for a
+	// caller's digest would let one app deploy an image that was only ever
+	// pushed to another app.
+	from map[string]int
 }
 
-// Deploy releases a pushed image.
+// image is one image of a request.
+type image struct {
+	// name is "" for the app's own image.
+	name, digest string
+	// from is the recorded release the digest came from, 0 for the caller's.
+	from int
+}
+
+// all lists the request's images, the app's own first and the rest by name.
+func (r request) all() []image {
+	list := []image{{digest: r.digest, from: r.from[""]}}
+	names := make([]string, 0, len(r.images))
+	for name := range r.images {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		list = append(list, image{name: name, digest: r.images[name], from: r.from[name]})
+	}
+	return list
+}
+
+// fill sets the request's images. What the caller gave comes first; every
+// image it left out is taken from the first of the recorded releases that
+// has it. So a deploy that names one image keeps the others as they are, and
+// a rollback brings back the set the old release ran.
+func (r *request) fill(digest string, given map[string]string, recorded ...releases.Release) error {
+	for name := range given {
+		if !r.app.HasImage(name) {
+			return fmt.Errorf("verify: image %q: %w", name, ErrUnknownImage)
+		}
+	}
+	r.images, r.from = nil, map[string]int{}
+	if r.digest = digest; r.digest == "" {
+		r.digest, r.from[""] = firstRecorded(recorded, func(rel releases.Release) string { return rel.Digest })
+	}
+	if r.digest == "" {
+		return fmt.Errorf("verify: %w: the app has no release to take its image from", ErrNoRelease)
+	}
+	for _, name := range r.app.Images {
+		d, from := given[name], 0
+		if d == "" {
+			d, from = firstRecorded(recorded, func(rel releases.Release) string { return rel.Images[name] })
+		}
+		if d == "" {
+			return fmt.Errorf("verify: %w", notDeployed(name))
+		}
+		if r.images == nil {
+			r.images = map[string]string{}
+		}
+		r.images[name] = d
+		if from != 0 {
+			r.from[name] = from
+		}
+	}
+	return nil
+}
+
+// firstRecorded returns the digest get finds in the first release that has
+// one, and that release's number.
+func firstRecorded(recorded []releases.Release, get func(releases.Release) string) (string, int) {
+	for _, rel := range recorded {
+		if d := get(rel); d != "" {
+			return d, rel.Number
+		}
+	}
+	return "", 0
+}
+
+// recordedReleases returns the releases that exist, in the order given.
+func recordedReleases(st *releases.State, numbers ...int) []releases.Release {
+	var list []releases.Release
+	for _, n := range numbers {
+		if rel, ok := st.Find(n); ok {
+			list = append(list, rel)
+		}
+	}
+	return list
+}
+
+// Deploy releases a pushed image. The app's extra images stay as they are.
 func (e *Engine) Deploy(ctx context.Context, app *appdef.App, digest, by string, sink Sink) (releases.Release, error) {
-	return e.locked(ctx, request{app: app, digest: digest, by: by}, sink, nil)
+	return e.DeployImages(ctx, app, digest, nil, by, sink)
+}
+
+// DeployImages releases pushed images: digest is the app's own image and
+// images its extra ones by name. Whatever is left out, digest included, is
+// taken from the current release.
+func (e *Engine) DeployImages(ctx context.Context, app *appdef.App, digest string, images map[string]string, by string, sink Sink) (releases.Release, error) {
+	pick := func(st *releases.State) (request, error) {
+		req := request{app: app, by: by}
+		return req, req.fill(digest, images, recordedReleases(st, st.Current)...)
+	}
+	return e.locked(ctx, request{app: app}, sink, pick)
 }
 
 // Rollback re-activates an older release's image without running the release
@@ -206,7 +303,10 @@ func (e *Engine) Rollback(ctx context.Context, app *appdef.App, target int, by s
 		if !ok {
 			return request{}, ErrNoRelease
 		}
-		return request{app: app, digest: rel.Digest, by: by, skipRelease: true, rolledBackFrom: st.Current, fromRelease: rel.Number}, nil
+		req := request{app: app, by: by, skipRelease: true, rolledBackFrom: st.Current}
+		// An image the app declared after the old release was made comes
+		// from the current one.
+		return req, req.fill("", nil, append([]releases.Release{rel}, recordedReleases(st, st.Current)...)...)
 	}
 	return e.locked(ctx, request{app: app}, sink, pick)
 }
@@ -219,7 +319,8 @@ func (e *Engine) Redeploy(ctx context.Context, app *appdef.App, by string, sink 
 		if !ok {
 			return request{}, ErrNoRelease
 		}
-		return request{app: app, digest: rel.Digest, by: by, skipRelease: true, fromRelease: rel.Number}, nil
+		req := request{app: app, by: by, skipRelease: true}
+		return req, req.fill("", nil, rel)
 	}
 	return e.locked(ctx, request{app: app}, sink, pick)
 }
@@ -292,8 +393,10 @@ func (s stepper) do(step string, fn func() error) error {
 func (e *Engine) run(ctx context.Context, req request, st *releases.State, sink Sink) (releases.Release, error) {
 	app := req.app
 	none := releases.Release{}
-	if !ValidDigest(req.digest) {
-		return none, fmt.Errorf("verify: %q is not a sha256 digest", req.digest)
+	for _, img := range req.all() {
+		if !ValidDigest(img.digest) {
+			return none, fmt.Errorf("verify: %q is not a sha256 digest", img.digest)
+		}
 	}
 
 	// Reserve the release number first so a failed attempt never shares a
@@ -307,15 +410,10 @@ func (e *Engine) run(ctx context.Context, req request, st *releases.State, sink 
 	out := &logWriter{sink: sink, step: "release", release: number}
 
 	if err := steps.do("verify", func() error {
-		if req.fromRelease != 0 {
-			return e.ensureImage(ctx, app.Name, req.digest, req.fromRelease)
-		}
-		ok, err := e.Runtime.ImageExists(ctx, app.Name, req.digest)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return ErrUnknownDigest
+		for _, img := range req.all() {
+			if err := e.verifyImage(ctx, app.Name, img); err != nil {
+				return err
+			}
 		}
 		return nil
 	}); err != nil {
@@ -333,7 +431,7 @@ func (e *Engine) run(ctx context.Context, req request, st *releases.State, sink 
 		}
 	}()
 
-	if err := e.prepare(ctx, app, number, req.digest, port); err != nil {
+	if err := e.prepare(ctx, app, number, req.digest, req.images, port); err != nil {
 		return none, fmt.Errorf("start: %w", err)
 	}
 	// From here on, a failure must leave nothing of this attempt behind.
@@ -371,7 +469,7 @@ func (e *Engine) run(ctx context.Context, req request, st *releases.State, sink 
 	// crash after it converges forward instead of back.
 	previous := st.Current
 	rel := releases.Release{
-		Number: number, Digest: req.digest, Port: port, Time: e.Now().UTC(), By: req.by,
+		Number: number, Digest: req.digest, Images: req.images, Port: port, Time: e.Now().UTC(), By: req.by,
 		RolledBackFrom: req.rolledBackFrom,
 	}
 	st.Releases = append(st.Releases, rel)
@@ -417,14 +515,44 @@ func (e *Engine) abort(ctx context.Context, app string, number int, err error) e
 	return err
 }
 
+// verifyImage checks that one image of a request is in the app's repository.
+func (e *Engine) verifyImage(ctx context.Context, app string, img image) error {
+	var err error
+	if img.from != 0 {
+		err = e.ensureImage(ctx, app, img.digest, img.from, img.name)
+	} else {
+		var ok bool
+		if ok, err = e.Runtime.ImageExists(ctx, app, img.digest); err == nil && !ok {
+			err = ErrUnknownDigest
+		}
+	}
+	if err != nil && img.name != "" {
+		return fmt.Errorf("image %q: %w", img.name, err)
+	}
+	return err
+}
+
+// ensureRelease makes sure every image of a recorded release still has its
+// name in the app's repository.
+func (e *Engine) ensureRelease(ctx context.Context, app string, rel releases.Release) error {
+	req := request{digest: rel.Digest, images: rel.Images}
+	for _, img := range req.all() {
+		img.from = rel.Number
+		if err := e.verifyImage(ctx, app, img); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ensureImage makes sure a recorded release's image still has its name in
 // the app's repository, restoring the name when the content survived.
-func (e *Engine) ensureImage(ctx context.Context, app, digest string, release int) error {
+func (e *Engine) ensureImage(ctx context.Context, app, digest string, release int, image string) error {
 	ok, err := e.Runtime.ImageExists(ctx, app, digest)
 	if err != nil || ok {
 		return err
 	}
-	if err := e.Runtime.Repin(ctx, app, digest, release); err != nil {
+	if err := e.Runtime.Repin(ctx, app, digest, release, image); err != nil {
 		return ErrImageGone
 	}
 	ok, err = e.Runtime.ImageExists(ctx, app, digest)
@@ -437,7 +565,7 @@ func (e *Engine) ensureImage(ctx context.Context, app, digest string, release in
 	return nil
 }
 
-func (e *Engine) prepare(ctx context.Context, app *appdef.App, number int, digest string, port int) error {
+func (e *Engine) prepare(ctx context.Context, app *appdef.App, number int, digest string, images map[string]string, port int) error {
 	if err := e.Runtime.EnsureNetwork(ctx, app.Name); err != nil {
 		return err
 	}
@@ -445,7 +573,7 @@ func (e *Engine) prepare(ctx context.Context, app *appdef.App, number int, diges
 	if err != nil {
 		return err
 	}
-	data, err := app.Render(appdef.RenderInput{Release: number, Digest: digest, Port: port, Env: env})
+	data, err := app.Render(appdef.RenderInput{Release: number, Digest: digest, Images: images, Port: port, Env: env})
 	if err != nil {
 		return err
 	}
@@ -466,8 +594,11 @@ func (e *Engine) afterSwitch(ctx context.Context, app *appdef.App, st *releases.
 	out := &logWriter{sink: sink, step: "services", release: number}
 	_ = steps.do("services", func() error { return e.Runtime.UpServices(ctx, app, number, out) })
 	_ = steps.do("cleanup", func() error {
-		if err := e.Runtime.Pin(ctx, app.Name, st.Releases[len(st.Releases)-1].Digest, number); err != nil {
-			return err
+		live := st.Releases[len(st.Releases)-1]
+		for _, img := range (request{digest: live.Digest, images: live.Images}).all() {
+			if err := e.Runtime.Pin(ctx, app.Name, img.digest, number, img.name); err != nil {
+				return err
+			}
 		}
 		return e.prune(ctx, app, st, warn)
 	})
@@ -520,14 +651,17 @@ func (e *Engine) pruneTags(ctx context.Context, app string, st *releases.State, 
 //
 // A release tag of a release that is no longer kept goes at once, and so does
 // any other tag on the image of the current release, which this deploy just
-// made: that is the deploy's own push tag, and the release tag already
-// protects the image. Every other tag is left for pushTagGrace from the
+// made, its extra images included: that is the deploy's own push tag, and
+// the release tag already protects the image. Every other tag is left for pushTagGrace from the
 // moment it is first seen: it may belong to a push whose deploy has not
 // started yet, even when it names the image of an older kept release.
 func staleTags(st *releases.State, tags []runtime.Tag, now time.Time) []string {
 	keep := make(map[string]bool, len(st.Releases))
 	for _, r := range st.Releases {
 		keep[runtime.ReleaseTag(r.Number)] = true
+		for name := range r.Images {
+			keep[runtime.ImageTag(r.Number, name)] = true
+		}
 	}
 	cur, _ := st.CurrentRelease()
 	// Rebuilding the map forgets tags that are gone.
@@ -537,7 +671,7 @@ func staleTags(st *releases.State, tags []runtime.Tag, now time.Time) []string {
 		_, own := runtime.ParseReleaseTag(tag.Name)
 		switch {
 		case keep[tag.Name]:
-		case own || (tag.Digest != "" && tag.Digest == cur.Digest):
+		case own || cur.Uses(tag.Digest):
 			stale = append(stale, tag.Name)
 		default:
 			first, seen := st.PendingTags[tag.Name]
@@ -628,14 +762,14 @@ func (e *Engine) Reconcile(ctx context.Context, app *appdef.App) error {
 		return nil
 	}
 	stopped, currentFound := ws.stopped, ws.found
-	if err := e.ensureImage(ctx, name, cur.Digest, cur.Number); err != nil {
+	if err := e.ensureRelease(ctx, name, cur); err != nil {
 		return err
 	}
 	if err := e.Runtime.EnsureNetwork(ctx, name); err != nil {
 		return err
 	}
 	if !e.Runtime.HasCompose(name, cur.Number) || !currentFound {
-		if err := e.prepare(ctx, app, cur.Number, cur.Digest, cur.Port); err != nil {
+		if err := e.prepare(ctx, app, cur.Number, cur.Digest, cur.Images, cur.Port); err != nil {
 			return err
 		}
 	} else if _, err := e.Env(ctx, app); err != nil {
@@ -652,7 +786,20 @@ func (e *Engine) Reconcile(ctx context.Context, app *appdef.App) error {
 	if err := e.Proxy.Switch(ctx, name, app.Domains, cur.Port); err != nil {
 		return err
 	}
+	// An image declared since the release was made has no digest in it, and
+	// the release's compose file has no service for it. The web container is
+	// converged by now; the rest waits for a deploy that brings the image.
+	for _, image := range app.Images {
+		if cur.Images[image] == "" {
+			return notDeployed(image)
+		}
+	}
 	return e.Runtime.UpServices(ctx, app, cur.Number, io.Discard)
+}
+
+// notDeployed is the error for an extra image no release has a digest for.
+func notDeployed(image string) error {
+	return fmt.Errorf("image %q has not been deployed for this app yet; deploy it with --image %s=<ref>", image, image)
 }
 
 // removeStale removes the containers of releases that are not current: the

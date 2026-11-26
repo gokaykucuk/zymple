@@ -31,7 +31,8 @@ telemetry to whatever backend the operator runs elsewhere.
 3. **A deploy names a digest.** Pushing an image does not deploy it. Tags are
    never trusted to stay put.
 4. **Opinionated.** docker-compose is the only app format. Postgres and Redis
-   are the only managed services. One image per app. One host per app.
+   are the only managed services. One repository per app, holding its own
+   image and any extra images it declares. One host per app.
 5. **Rebuildable.** A host is fully described by the infra repo. Recovery is
    an Ansible run, a Postgres restore, and a re-deploy per app.
 
@@ -93,9 +94,10 @@ publish nothing; apps reach them over the app's Docker network.
   listing, deleting and cross-repository mounts are refused. So is any path
   the registry would read as a repository nested under the app's own, such
   as `zymple/<app>/blobs/uploads/x`.
-- A push may not write a tag of the form `release-<n>`. Those are the tags
-  Zymple puts on kept releases; moving one would leave the image it named
-  without a name, and its content could be collected before a rollback.
+- A push may not write a tag of the form `release-<n>` or
+  `release-<n>-<image>`. Those are the tags Zymple puts on kept releases;
+  moving one would leave the image it named without a name, and its content
+  could be collected before a rollback.
 - A blob belongs to the repositories that uploaded its bytes. Existence
   checks and manifests see only the app's own blobs, so a manifest cannot
   name content another app pushed, even when the digest is known.
@@ -121,6 +123,7 @@ release_timeout: 1h           # default; 1s to 24h
 keep_releases: 5              # default
 postgres: { version: 17, pitr_days: 14 }
 redis: { persistent: false }
+images: [ocr]                 # optional extra images, see below
 ```
 
 `postgres` and `redis` each take an optional `env`: the name of the variable
@@ -128,6 +131,31 @@ their connection URL is injected as. The defaults are `DATABASE_URL` and
 `REDIS_URL`. An app that reads its own names sets them here, for example
 `postgres: { version: 17, env: SHOP_DATABASE_URL }`, since the compose file
 cannot rename variables.
+
+### Extra images
+
+An app is one image by default. `images` names up to 8 more, for parts of the
+app that are built from another Dockerfile, such as a document processor. A
+name is lowercase letters, digits and `_`, starting with a letter, at most 31
+characters.
+
+- A compose service runs an extra image by naming `${IMAGE_<NAME>}`, the name
+  in upper case: `${IMAGE_OCR}` for `ocr`.
+- The web service runs `${IMAGE}`. The release command and `zymple run` use
+  that image too.
+- Every declared image must be used by a service, and every placeholder must
+  be declared.
+- Extra images are pushed to the app's own repository, `zymple/<app>`, with
+  the app's token. There is no second repository and no second token.
+- A release records the digest of every image and pins all of them, so a
+  rollback brings back the set that ran together.
+- A deploy names the images it changes. Any it leaves out, the app's own
+  included, stay at the digest of the current release. The first deploy
+  after an image is declared has to name it, and until then `redeploy` and
+  `reload` report that the image has not been deployed; the running release
+  is not touched.
+- A rollback to a release made before an image was declared takes that image
+  from the current release.
 
 Unknown keys are an error. A definition that fails validation is reported by
 `zymple reload` and ignored; the previously loaded app keeps running on its
@@ -148,7 +176,8 @@ The compose file is checked against an allow-list. Anything not on it is
 rejected.
 
 - Top level: `services` and `volumes` only.
-- Every service's `image` must be exactly `${IMAGE}`.
+- Every service's `image` must be exactly `${IMAGE}`, or `${IMAGE_<NAME>}`
+  for an extra image the app declares.
 - Service keys: `image`, `command`, `entrypoint`, `environment`,
   `healthcheck`, `restart`, `stop_grace_period`, `stop_signal`,
   `working_dir`, `user`, `init`, `read_only`, `tmpfs`, `mem_limit`, `cpus`,
@@ -170,7 +199,7 @@ rejected.
 - `DATABASE_URL`, `REDIS_URL` and any names chosen with `env` may not be set
   by the app.
 
-For each release Zymple renders the file it actually runs: the image pinned
+For each release Zymple renders the file it actually runs: each image pinned
 by digest, `pull_policy: never`, `no-new-privileges`, the env file, labels,
 the app's network, and, for the web service, a per-release service name and a
 loopback port.
@@ -193,23 +222,27 @@ switch.
 ## Deploy
 
 ```
-zymple deploy <app> --image <ref>
+zymple deploy <app> --image <ref> [--image <name>=<ref>]...
 ```
 
-1. The CLI tags the local image for `<host>/zymple/<app>` and pushes it with
+1. The CLI tags each local image for `<host>/zymple/<app>` and pushes it with
    the docker CLI, using a temporary docker config so the user's own login
    state is untouched. Layers the host already has are skipped.
-2. The CLI calls `POST /api/v1/apps/<app>/deploys` with the digest. The
-   response is a stream of events until the deploy ends. The CLI prints them
-   and exits non-zero on failure.
+2. The CLI calls `POST /api/v1/apps/<app>/deploys` with the digests:
+   `{"digest": "sha256:...", "images": {"<name>": "sha256:..."}}`. Either
+   part may be left out. The response is a stream of events until the deploy
+   ends. The CLI prints them and exits non-zero on failure.
 
-`zymple deploy <app> --digest sha256:...` skips the push.
+`--digest sha256:...` and `--digest <name>=sha256:...` name an image that is
+already on the host and skip its push. Both flags repeat, one value per
+image. `zymple deploy <app> --image ocr=<ref>` releases a new document
+processor on the app's current image; the release command still runs.
 
 Server side, per deploy:
 
 | Step | Action | On failure |
 |---|---|---|
-| verify | The digest exists in repository `zymple/<app>` | Reject |
+| verify | Every image is declared, and its digest exists in repository `zymple/<app>` | Reject |
 | | Take the app's deploy lock | HTTP 409 |
 | | Reserve a release number and a loopback port; start Postgres and Redis if they are not running | Abort |
 | release | Run `release` in a one-off container, for at most `release_timeout` | Abort, remove the one-off container, old release untouched |
@@ -219,7 +252,7 @@ Server side, per deploy:
 | | **Commit**: record the release as current | Switch back, abort |
 | drain | Wait `drain`, stop the old web container | Report, continue |
 | services | Recreate the other compose services on the new image | Report, continue |
-| cleanup | Pin the image, prune beyond `keep_releases` | Report, continue |
+| cleanup | Pin the images, prune beyond `keep_releases` | Report, continue |
 
 Until the commit the old release serves all traffic and a failure leaves
 nothing behind. After the commit the new release is live and nothing can fail
@@ -264,19 +297,22 @@ instant can be dropped, so domain changes are best made outside peak hours.
 
 ## Releases and rollback
 
-- Each successful deploy is a numbered release: digest, port, time, who.
-- The last `keep_releases` images are tagged `zymple/<app>:release-<n>`.
-  Older release tags are removed after each deploy. Only a tag of the exact
-  form `release-<n>` is Zymple's own. Any other tag is removed at once when
+- Each successful deploy is a numbered release: digest, the digests of the
+  extra images, port, time, who.
+- The last `keep_releases` images are tagged `zymple/<app>:release-<n>`, and
+  their extra images `zymple/<app>:release-<n>-<image>`. Older release tags
+  are removed after each deploy. Only a tag of one of those two exact forms
+  is Zymple's own. Any other tag is removed at once when
   its image is the release the deploy just made, and otherwise an hour after
   cleanup first saw it, so that an image another CI job has pushed but not
   yet deployed is not taken away under it. The first-seen times are kept in
   the app's release state (`pending_tags`), so a daemon restart does not
   restart the hour.
 - `zymple releases <app>` lists them.
-- `zymple rollback <app> [release]` runs the same sequence onto an image that
-  is already on the host, skipping the `release` command. No transfer.
-- Rollback reverts the image only. Migrations must stay compatible with the
+- `zymple rollback <app> [release]` runs the same sequence onto the images of
+  a release that are already on the host, skipping the `release` command. No
+  transfer.
+- Rollback reverts the images only. Migrations must stay compatible with the
   previous release (expand, deploy, contract).
 
 **`docker image prune -a` destroys rollback targets.** The tags protect kept
@@ -402,7 +438,7 @@ the import, because the import starts the app.
 From CI or a laptop, with `ZYMPLE_HOST` and `ZYMPLE_TOKEN`:
 
 ```
-zymple deploy <app> --image <ref> | --digest <sha256:...>
+zymple deploy <app> --image [<name>=]<ref> | --digest [<name>=]<sha256:...>
 zymple rollback <app> [release]
 zymple releases <app>
 zymple status <app>
@@ -524,6 +560,17 @@ Known limits:
 - **Manifest lookups are bounded.** A lookup by digest answers only for the
   app's own blobs of at most 4 MiB; anything larger is not a manifest and is
   never read into memory.
+
+- **Extra images share the app's repository.** A repository per image,
+  `zymple/<app>/<image>`, would have needed the registry guard to admit
+  nested repositories, which it refuses on purpose, and blob ownership and
+  manifest labels per nested repository. With one repository none of that
+  changes: an extra image is another digest the app's token pushed, and what
+  tells the images of a release apart is the release record and the tag
+  `release-<n>-<image>`. An image name has no `-` so that tag reads one way.
+- **A deploy names what changes.** A document processor is rebuilt far less
+  often than the app. Requiring every image on every deploy would make CI
+  push or look up digests it has no reason to know.
 
 ## Open items
 

@@ -81,6 +81,21 @@ ZYMPLE_HOST=https://deploy.example.com ZYMPLE_TOKEN=$TOKEN zymple deploy myapp -
 The command streams the deploy and exits non-zero if it fails. A failed
 deploy leaves the previous release serving.
 
+### An app with more than one image
+
+List the extra images in `app.yml` (`images: [ocr]`) and give each a compose
+service whose image is `${IMAGE_OCR}`. Push them with the same token:
+
+```bash
+zymple deploy myapp --image myapp:$GIT_SHA --image ocr=myapp-ocr:$GIT_SHA
+```
+
+The first deploy after declaring an image has to include it. After that a
+deploy changes only the images it names, so the usual pipeline can go on
+deploying `--image myapp:$GIT_SHA` alone, and the job that builds the
+document processor deploys `--image ocr=myapp-ocr:$GIT_SHA` when it changes.
+Each release pins the whole set, and a rollback brings the set back.
+
 ## Day to day
 
 ```bash

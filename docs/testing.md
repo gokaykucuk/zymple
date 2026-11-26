@@ -136,6 +136,23 @@ the corpus first.
   reload restores their image names, and a rollback to a lost image either
   succeeds from surviving content or is refused cleanly.
 
+### Extra images
+
+- End to end, an app with a second image: the first deploy is refused until
+  it brings both, each later deploy changes only the image it names while
+  requests keep being answered, a rollback brings back the pair, a prune of
+  dangling images leaves every kept release whole, and a push may not move
+  the tag that pins a release's extra image.
+- The engine is tested for the set as a unit: every image is verified before
+  anything starts, a missing or undeclared one refuses the deploy, the tags
+  of pruned releases go and those of kept ones stay, an image name lost to
+  `prune -a` is restored, and a rollback across a change of the declared
+  images takes what the old release lacks from the current one.
+- A placeholder is accepted only as the exact text Zymple writes for a
+  declared image; the variants compose would also interpolate (defaults,
+  prefixes, suffixes, lower case) are in the rejection tests, and fuzzing
+  asserts the same for arbitrary text and for release tags.
+
 ### Postgres
 
 End to end, against a real cluster: rows are written before and after a

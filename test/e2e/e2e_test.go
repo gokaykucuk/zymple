@@ -175,6 +175,92 @@ func TestKeepReleasesPrunesAndRollbackNeedsNoRegistry(t *testing.T) {
 	}
 }
 
+// An app with a second image: a release pins both, a deploy changes only the
+// image it names, and a rollback brings back the pair.
+func TestExtraImageIsPinnedWithTheRelease(t *testing.T) {
+	a := newApp(t, "duo", appOptions{images: "[side]", compose: `services:
+  web:
+    image: ${IMAGE}
+    init: true
+  side:
+    image: ${IMAGE_SIDE}
+    init: true
+`})
+	const v1, v2 = "zymple-e2e-app:v1", "zymple-e2e-app:v2"
+	// What the side container runs, read from inside it.
+	side := func() string {
+		t.Helper()
+		name := mustHost(t, "docker", "ps", "--filter", "label=zymple.app="+a.name,
+			"--filter", "label=com.docker.compose.service=side", "--format", "{{.Names}}")
+		if len(strings.Fields(name)) != 1 {
+			t.Fatalf("want exactly one side container, got %q", name)
+		}
+		return mustHost(t, "docker", "exec", name, "cat", "/www/version")
+	}
+	want := func(web, sideVersion string) {
+		t.Helper()
+		a.wantVersion(t, web)
+		if got := side(); got != sideVersion {
+			t.Fatalf("the side container runs %q, want %q", got, sideVersion)
+		}
+	}
+
+	// The first deploy has to bring both.
+	if out, err := a.cli("deploy", a.name, "--image", v1); err == nil || !strings.Contains(out, "has not been deployed") {
+		t.Fatalf("a deploy without the extra image: %v\n%s", err, out)
+	}
+	if webs := a.webContainers(t); len(webs) != 0 {
+		t.Fatalf("the refused deploy started %v", webs)
+	}
+
+	a.mustCLI(t, "deploy", a.name, "--image", v1, "--image", "side="+v2)
+	want("v1", "v2")
+	tags := strings.Fields(mustHost(t, "docker", "images", "--format", "{{.Tag}}", "zymple/"+a.name))
+	if len(tags) != 2 || !contains(tags, "release-1") || !contains(tags, "release-1-side") {
+		t.Fatalf("tags after the first deploy = %v, want release-1 and release-1-side", tags)
+	}
+	if status := a.mustCLI(t, "status", a.name); !strings.Contains(status, "image:     side (sha256:") {
+		t.Errorf("status does not show the extra image:\n%s", status)
+	}
+
+	// Only the app's image: the side container keeps its own.
+	l := a.startLoad()
+	a.mustCLI(t, "deploy", a.name, "--image", v2)
+	want("v2", "v2")
+	// Only the extra image: the web container keeps its own.
+	a.mustCLI(t, "deploy", a.name, "--image", "side="+v1)
+	want("v2", "v1")
+	// Back to the release before: both images of it.
+	a.mustCLI(t, "rollback", a.name)
+	want("v2", "v2")
+	a.mustCLI(t, "rollback", a.name, "1")
+	want("v1", "v2")
+	l.finish(t)
+
+	// A prune of dangling images must leave every kept release whole.
+	mustHost(t, "docker", "image", "prune", "-f")
+	a.mustCLI(t, "rollback", a.name, "3")
+	want("v2", "v1")
+
+	// A token may not move the tag that pins a release's extra image, while
+	// a tag of its own choosing is an ordinary upload.
+	for tag, want := range map[string]int{"release-1-side": http.StatusForbidden, "release-1-SIDE": http.StatusBadRequest} {
+		req, err := http.NewRequest(http.MethodPut, baseURL()+"/v2/zymple/"+a.name+"/manifests/"+tag, strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.SetBasicAuth(a.name, a.token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("PUT of manifest tag %s = %d, want %d", tag, resp.StatusCode, want)
+		}
+	}
+}
+
 func TestOnlyOneDeployAtATime(t *testing.T) {
 	a := newApp(t, "busy", appOptions{drain: "6s"})
 	a.deploy(t, "v1")

@@ -203,19 +203,43 @@ func (s *Server) engineRun(w http.ResponseWriter, r *http.Request, app *appdef.A
 
 func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request, app *appdef.App) {
 	var body struct {
-		Digest string `json:"digest"`
+		// Digest is the app's own image. It may be left out when Images
+		// names at least one extra image; the app's image then stays.
+		Digest string            `json:"digest"`
+		Images map[string]string `json:"images"`
 	}
 	if !readJSON(w, r, &body) {
 		return
 	}
-	if !deploy.ValidDigest(body.Digest) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "digest must be sha256:<64 hex characters>"})
+	if msg := checkDeployImages(app, body.Digest, body.Images); msg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
 	by := actor(r)
 	s.engineRun(w, r, app, func(ctx context.Context, sink deploy.Sink) (releases.Release, error) {
-		return s.Engine.Deploy(ctx, app, body.Digest, by, sink)
+		return s.Engine.DeployImages(ctx, app, body.Digest, body.Images, by, sink)
 	})
+}
+
+// checkDeployImages returns what is wrong with the images of a deploy
+// request, "" if nothing.
+func checkDeployImages(app *appdef.App, digest string, images map[string]string) string {
+	const want = "must be sha256:<64 hex characters>"
+	if digest == "" && len(images) == 0 {
+		return "digest " + want
+	}
+	if digest != "" && !deploy.ValidDigest(digest) {
+		return "digest " + want
+	}
+	for name, d := range images {
+		if !app.HasImage(name) {
+			return "the app declares no image of that name"
+		}
+		if !deploy.ValidDigest(d) {
+			return "the digest of image " + name + " " + want
+		}
+	}
+	return ""
 }
 
 func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request, app *appdef.App) {

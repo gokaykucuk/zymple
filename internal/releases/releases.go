@@ -14,14 +14,34 @@ import (
 
 // Release is one successful deploy.
 type Release struct {
-	Number int       `json:"number"`
-	Digest string    `json:"digest"`
-	Port   int       `json:"port"`
-	Time   time.Time `json:"time"`
+	Number int    `json:"number"`
+	Digest string `json:"digest"`
+	// Images holds the digests of the app's extra images, by name. The
+	// release pins them together with Digest, so a rollback brings back the
+	// whole set.
+	Images map[string]string `json:"images,omitempty"`
+	Port   int               `json:"port"`
+	Time   time.Time         `json:"time"`
 	// By is the id of the token that deployed it, or "admin".
 	By string `json:"by"`
 	// RolledBackFrom is set when the release re-activates an older image.
 	RolledBackFrom int `json:"rolled_back_from,omitempty"`
+}
+
+// Uses reports whether the digest is one of the release's images.
+func (r Release) Uses(digest string) bool {
+	if digest == "" {
+		return false
+	}
+	if r.Digest == digest {
+		return true
+	}
+	for _, d := range r.Images {
+		if d == digest {
+			return true
+		}
+	}
+	return false
 }
 
 // State is everything recorded for one app.

@@ -10,6 +10,7 @@ while read -r target pkg; do
 done <<'TARGETS'
 FuzzParseCompose ./internal/appdef
 FuzzParse ./internal/appdef
+FuzzPlaceholderImage ./internal/appdef
 FuzzParse ./internal/auth
 FuzzAuthorize ./internal/registry
 FuzzValidDigest ./internal/deploy
