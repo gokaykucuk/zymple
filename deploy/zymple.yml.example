@@ -1,0 +1,34 @@
+# /etc/zymple/zymple.yml. Every key is optional; these are the defaults,
+# except "backup", which is off until configured.
+
+listen: 127.0.0.1:7080            # must be loopback; Caddy is the public listener
+socket: /run/zymple/zymple.sock   # operator API, root only
+apps_dir: /etc/zymple/apps
+state_dir: /var/lib/zymple
+
+caddy:
+  snippets_dir: /etc/caddy/zymple
+  reload: ["systemctl", "reload", "caddy"]
+  tls: auto                       # auto | internal | off
+
+containerd:
+  socket: /run/containerd/containerd.sock
+  namespace: moby
+
+ports: { low: 20000, high: 29999 }  # loopback ports for web containers
+
+# backup:
+#   type: s3                      # or "posix" with path: /mnt/backups
+#   path: prod                    # key prefix inside the bucket
+#   cipher_pass: change-me        # encrypts the repository; required for Redis
+#   s3:
+#     endpoint: s3.example.com
+#     bucket: backups
+#     region: eu
+#     access_key: ...
+#     secret_key: ...
+#     path_style: true
+
+# postgres_images: { 17: ghcr.io/gokaykucuk/zymple-postgres:17 }
+# redis_image: redis:7-alpine
+# restic_image: restic/restic:0.17.3

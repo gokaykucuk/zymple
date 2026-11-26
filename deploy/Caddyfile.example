@@ -1,0 +1,17 @@
+# Base Caddyfile for a Zymple host. Zymple writes one snippet per app into
+# /etc/caddy/zymple/ and asks Caddy to reload; nothing else here changes.
+
+# The registry and deploy API. Use a hostname only your CI and operators know
+# how to reach; restrict it by source address if you can.
+deploy.example.com {
+	# Image layers can be large.
+	request_body {
+		max_size 10GB
+	}
+	reverse_proxy 127.0.0.1:7080 {
+		# Deploy output is streamed line by line.
+		flush_interval -1
+	}
+}
+
+import /etc/caddy/zymple/*.caddy

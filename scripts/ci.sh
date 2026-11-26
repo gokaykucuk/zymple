@@ -25,6 +25,10 @@ go vet ./...
 step "go test"
 go test -race -shuffle=on -coverprofile=coverage.out ./...
 
+step "fuzz (short)"
+# A few seconds per target catches regressions; the nightly job runs longer.
+./scripts/fuzz.sh
+
 step unc
 unc_args=(analyze --format "${UNC_FORMAT:-text}" --go-coverage coverage.out --fail-on major)
 # The first push has no base branch to compare against.

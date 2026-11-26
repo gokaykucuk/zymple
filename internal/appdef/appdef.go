@@ -1,0 +1,307 @@
+// Package appdef loads and validates app definitions: the app.yml and
+// compose.yml that the operator's infra repo renders onto the host.
+package appdef
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Limits and defaults.
+const (
+	DefaultKeepReleases  = 5
+	DefaultHealthTimeout = 60 * time.Second
+	DefaultDrain         = 30 * time.Second
+	DefaultPITRDays      = 14
+	maxFileSize          = 1 << 20
+)
+
+var (
+	nameRe   = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}[a-z0-9]$`)
+	domainRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	pathRe   = regexp.MustCompile(`^/[A-Za-z0-9/_.\-?=&%]*$`)
+)
+
+// Duration is a time.Duration that unmarshals from a string such as "30s".
+type Duration time.Duration
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
+	var s string
+	if err := node.Decode(&s); err != nil {
+		return err
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q", s)
+	}
+	*d = Duration(v)
+	return nil
+}
+
+// Web describes the one service that receives HTTP traffic.
+type Web struct {
+	Service       string   `yaml:"service"`
+	Port          int      `yaml:"port"`
+	Healthcheck   string   `yaml:"healthcheck"`
+	HealthTimeout Duration `yaml:"health_timeout"`
+	Drain         Duration `yaml:"drain"`
+}
+
+// Postgres declares a managed Postgres cluster.
+type Postgres struct {
+	Version  int `yaml:"version"`
+	PITRDays int `yaml:"pitr_days"`
+}
+
+// Redis declares a managed Redis instance.
+type Redis struct {
+	Persistent bool `yaml:"persistent"`
+}
+
+// App is one validated app definition.
+type App struct {
+	Name         string    `yaml:"name"`
+	Domains      []string  `yaml:"domains"`
+	ComposeFile  string    `yaml:"compose"`
+	Web          Web       `yaml:"web"`
+	Release      []string  `yaml:"release"`
+	KeepReleases int       `yaml:"keep_releases"`
+	Postgres     *Postgres `yaml:"postgres"`
+	Redis        *Redis    `yaml:"redis"`
+	// Env names the secrets file in the infra repo. On the host the file is
+	// always <dir>/env, so the value is accepted and ignored.
+	Env string `yaml:"env"`
+
+	// Dir is the directory the definition was loaded from.
+	Dir string `yaml:"-"`
+	// Compose is the validated compose document.
+	Compose *Compose `yaml:"-"`
+}
+
+// EnvFile returns the path of the app's env file, or "" if it has none.
+func (a *App) EnvFile() string {
+	p := filepath.Join(a.Dir, "env")
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
+}
+
+// TokensFile returns the path of the app's token hash file.
+func (a *App) TokensFile() string { return filepath.Join(a.Dir, "tokens") }
+
+// Parse validates an app definition and its compose file.
+func Parse(appYAML, composeYAML []byte) (*App, error) {
+	if len(appYAML) > maxFileSize || len(composeYAML) > maxFileSize {
+		return nil, errors.New("definition too large")
+	}
+	var app App
+	dec := yaml.NewDecoder(bytes.NewReader(appYAML))
+	dec.KnownFields(true)
+	if err := dec.Decode(&app); err != nil {
+		return nil, fmt.Errorf("app.yml: %w", err)
+	}
+	app.applyDefaults()
+	if err := app.validate(); err != nil {
+		return nil, fmt.Errorf("app.yml: %w", err)
+	}
+	compose, err := ParseCompose(composeYAML)
+	if err != nil {
+		return nil, fmt.Errorf("compose: %w", err)
+	}
+	if _, ok := compose.Services[app.Web.Service]; !ok {
+		return nil, fmt.Errorf("app.yml: web.service %q is not a service in the compose file", app.Web.Service)
+	}
+	app.Compose = compose
+	return &app, nil
+}
+
+func (a *App) applyDefaults() {
+	if a.KeepReleases == 0 {
+		a.KeepReleases = DefaultKeepReleases
+	}
+	if a.Web.HealthTimeout == 0 {
+		a.Web.HealthTimeout = Duration(DefaultHealthTimeout)
+	}
+	if a.Web.Drain == 0 {
+		a.Web.Drain = Duration(DefaultDrain)
+	}
+	if a.Web.Healthcheck == "" {
+		a.Web.Healthcheck = "/"
+	}
+	if a.ComposeFile == "" {
+		a.ComposeFile = "compose.yml"
+	}
+	if a.Postgres != nil && a.Postgres.PITRDays == 0 {
+		a.Postgres.PITRDays = DefaultPITRDays
+	}
+}
+
+func (a *App) validate() error {
+	if !ValidName(a.Name) {
+		return fmt.Errorf("name %q must match %s", a.Name, nameRe)
+	}
+	if err := validateDomains(a.Domains); err != nil {
+		return err
+	}
+	if a.ComposeFile != filepath.Base(a.ComposeFile) || a.ComposeFile == "." || a.ComposeFile == ".." {
+		return fmt.Errorf("compose %q must be a file name inside the app directory", a.ComposeFile)
+	}
+	if err := a.Web.validate(); err != nil {
+		return err
+	}
+	for _, arg := range a.Release {
+		if arg == "" {
+			return errors.New("release command arguments must not be empty")
+		}
+	}
+	if a.KeepReleases < 1 || a.KeepReleases > 50 {
+		return errors.New("keep_releases must be between 1 and 50")
+	}
+	return a.Postgres.validate()
+}
+
+func validateDomains(domains []string) error {
+	if len(domains) == 0 {
+		return errors.New("at least one domain is required")
+	}
+	for _, d := range domains {
+		if len(d) > 253 || !domainRe.MatchString(d) {
+			return fmt.Errorf("domain %q is not a plain lowercase hostname", d)
+		}
+	}
+	return nil
+}
+
+func (p *Postgres) validate() error {
+	if p == nil {
+		return nil
+	}
+	if p.Version < 14 || p.Version > 18 {
+		return errors.New("postgres.version must be between 14 and 18")
+	}
+	if p.PITRDays < 1 || p.PITRDays > 365 {
+		return errors.New("postgres.pitr_days must be between 1 and 365")
+	}
+	return nil
+}
+
+func (w *Web) validate() error {
+	if !serviceRe.MatchString(w.Service) {
+		return fmt.Errorf("web.service %q is not a valid service name", w.Service)
+	}
+	if w.Port < 1 || w.Port > 65535 {
+		return errors.New("web.port must be between 1 and 65535")
+	}
+	if len(w.Healthcheck) > 256 || !pathRe.MatchString(w.Healthcheck) {
+		return fmt.Errorf("web.healthcheck %q must be a URL path", w.Healthcheck)
+	}
+	if t := time.Duration(w.HealthTimeout); t < time.Second || t > 10*time.Minute {
+		return errors.New("web.health_timeout must be between 1s and 10m")
+	}
+	if d := time.Duration(w.Drain); d < 0 || d > 5*time.Minute {
+		return errors.New("web.drain must be between 0s and 5m")
+	}
+	return nil
+}
+
+// ValidName reports whether s is an acceptable app name.
+func ValidName(s string) bool { return nameRe.MatchString(s) }
+
+// Load reads one app directory.
+func Load(dir string) (*App, error) {
+	appYAML, err := readLimited(filepath.Join(dir, "app.yml"))
+	if err != nil {
+		return nil, err
+	}
+	// The compose file name comes from app.yml, so decode loosely first.
+	var probe struct {
+		Compose string `yaml:"compose"`
+	}
+	if err := yaml.Unmarshal(appYAML, &probe); err != nil {
+		return nil, fmt.Errorf("app.yml: %w", err)
+	}
+	if probe.Compose == "" {
+		probe.Compose = "compose.yml"
+	}
+	if probe.Compose != filepath.Base(probe.Compose) {
+		return nil, fmt.Errorf("app.yml: compose %q must be a file name inside the app directory", probe.Compose)
+	}
+	composeYAML, err := readLimited(filepath.Join(dir, probe.Compose))
+	if err != nil {
+		return nil, err
+	}
+	app, err := Parse(appYAML, composeYAML)
+	if err != nil {
+		return nil, err
+	}
+	if app.Name != filepath.Base(dir) {
+		return nil, fmt.Errorf("app.yml: name %q does not match directory %q", app.Name, filepath.Base(dir))
+	}
+	app.Dir = dir
+	return app, nil
+}
+
+// LoadAll reads every app directory under root. A broken definition does not
+// hide the others: valid apps are returned together with the joined errors.
+func LoadAll(root string) (map[string]*App, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	apps := make(map[string]*App)
+	var errs []error
+	domains := make(map[string]string)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		app, err := Load(filepath.Join(root, name))
+		if err != nil {
+			errs = append(errs, fmt.Errorf("app %s: %w", name, err))
+			continue
+		}
+		if owner := firstClaimed(domains, app); owner != "" {
+			errs = append(errs, fmt.Errorf("app %s: a domain is already used by app %s", name, owner))
+			continue
+		}
+		for _, d := range app.Domains {
+			domains[d] = name
+		}
+		apps[name] = app
+	}
+	return apps, errors.Join(errs...)
+}
+
+func firstClaimed(domains map[string]string, app *App) string {
+	for _, d := range app.Domains {
+		if owner, ok := domains[d]; ok {
+			return owner
+		}
+	}
+	return ""
+}
+
+func readLimited(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maxFileSize {
+		return nil, fmt.Errorf("%s: larger than %d bytes", path, maxFileSize)
+	}
+	return os.ReadFile(path)
+}

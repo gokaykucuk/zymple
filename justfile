@@ -3,13 +3,21 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-# Everything GitHub CI runs: format, vet, tests, unc, govulncheck.
+# The gate GitHub CI runs: format, vet, tests, short fuzzing, unc, govulncheck.
 ci:
     ./scripts/ci.sh
 
-# Tests only.
+# End-to-end tests against a throwaway Docker-in-Docker host. Needs Docker.
+e2e *args="":
+    ./scripts/e2e.sh {{ args }}
+
+# Unit tests only.
 test *args="./...":
     go test -race -shuffle=on {{ args }}
+
+# Fuzz every target for a while (default one minute each).
+fuzz time="1m":
+    FUZZTIME={{ time }} ./scripts/fuzz.sh
 
 # Static analysis only.
 lint:
