@@ -201,7 +201,11 @@ file which is not an archive leaves the app serving.
 ## Not covered yet
 
 - S3 backup repositories end to end. The tests use a directory repository;
-  the S3 settings Zymple generates are unit-tested only.
+  the S3 settings Zymple generates are unit-tested only. This gap has
+  already hidden one bug: the Postgres image shipped without certificate
+  authorities, which a directory repository never needs. The image is now
+  checked for them, in the suite and before it is published, but nothing
+  yet pushes a backup to an S3 endpoint over TLS.
 - Redis backup and restore end to end.
 - Upgrading Zymple from a previous release with apps running.
 - Disk-full behaviour during a push or a deploy.

@@ -38,6 +38,8 @@ jobs:
           docker build --pull --build-arg "PG_MAJOR=$MAJOR" -t "$image:$MAJOR-$arch" images/postgres
           # The image must contain a working pgBackRest before it is published.
           docker run --rm --entrypoint pgbackrest "$image:$MAJOR-$arch" version
+          # And the certificate authorities pgBackRest needs to reach a bucket.
+          docker run --rm --entrypoint test "$image:$MAJOR-$arch" -s /etc/ssl/certs/ca-certificates.crt
           docker push "$image:$MAJOR-$arch"
 
   manifest:
