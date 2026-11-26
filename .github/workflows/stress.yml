@@ -7,7 +7,7 @@ on:
     inputs:
       cycles:
         description: Switches per runner
-        default: "30"
+        default: "40"
   push:
     branches: ["stress/**"]
 
@@ -31,5 +31,5 @@ jobs:
           go-version-file: go.mod
       - name: Stress the traffic switch
         env:
-          ZYMPLE_E2E_STRESS: ${{ inputs.cycles || '30' }}
+          ZYMPLE_E2E_STRESS: ${{ inputs.cycles || '40' }}
         run: ./scripts/e2e.sh -v -run TestStressSwitches

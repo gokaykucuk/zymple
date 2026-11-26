@@ -35,6 +35,11 @@ func TestDeployRollbackWithZeroDowntime(t *testing.T) {
 	if webs := a.webContainers(t); len(webs) != 1 {
 		t.Errorf("want exactly one web container after the deploys, got %v", webs)
 	}
+	// Only the first deploy loads a new site into Caddy. The three switches
+	// after it must not reload it.
+	if reloads := mustHost(t, "sh", "-c", `grep -c '"msg":"load complete"' /var/log/caddy.log || true`); reloads != "" {
+		t.Logf("caddy config loads so far: %s", reloads)
+	}
 	releases := a.mustCLI(t, "releases", a.name)
 	if !strings.Contains(releases, "rollback from 2") || !strings.Contains(releases, "current") {
 		t.Errorf("releases output misses the rollback or the current marker:\n%s", releases)
@@ -470,7 +475,7 @@ done; echo "$n" > /tmp/stress.total`
 	l.stop()
 	l.done.Wait()
 
-	insideFailures, _ := hostOutput("cat", "/tmp/stress.fail")
+	insideFailures, _ := hostOutput("sh", "-c", "cat /tmp/stress.fail 2>/dev/null || true")
 	t.Logf("inside the host: %s requests, failures:\n%s", mustHost(t, "cat", "/tmp/stress.total"), insideFailures)
 	t.Logf("outside: %d requests, %d failed:\n%s", l.total.Load(), l.failed.Load(), l.failureLog())
 	if insideFailures != "" || l.failed.Load() != 0 {
