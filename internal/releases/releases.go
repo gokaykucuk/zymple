@@ -121,5 +121,21 @@ func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+// syncDir flushes a directory, which is what makes a rename in it survive a
+// power loss. Without it the file's new content is on disk but its name may
+// still point at the old one, and a release recorded as live, or a release
+// number already handed out, would be forgotten.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }

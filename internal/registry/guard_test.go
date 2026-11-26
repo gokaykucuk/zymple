@@ -46,6 +46,11 @@ func TestAuthorize(t *testing.T) {
 		{"PUT", "/v2/zymple/shop//manifests/latest", false},
 		{"PUT", "/v2/zymple/shop/manifests/a/b", false},
 		{"PUT", "/v2/zymple/shop/manifests/", false},
+		// Zymple's own pin tags may be looked up but never moved by a push.
+		{"PUT", "/v2/zymple/shop/manifests/release-3", false},
+		{"HEAD", "/v2/zymple/shop/manifests/release-3", true},
+		{"PUT", "/v2/zymple/shop/manifests/release-1.4.0", true},
+		{"PUT", "/v2/zymple/shop/manifests/release-07", true},
 		{"HEAD", "/v2/zymple/shop/blobs/", false},
 		{"GET", "/", false},
 		{"GET", "/v2/zymple/shop", false},

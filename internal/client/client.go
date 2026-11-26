@@ -38,8 +38,13 @@ func New(host, token string) (*Client, error) {
 	if token == "" {
 		return nil, errors.New("a token is required (set ZYMPLE_TOKEN)")
 	}
-	return &Client{Base: strings.TrimSuffix(u.Scheme+"://"+u.Host+u.Path, "/"), Token: token, HTTP: &http.Client{}}, nil
+	return &Client{Base: strings.TrimSuffix(u.Scheme+"://"+u.Host+u.Path, "/"), Token: token, HTTP: &http.Client{CheckRedirect: noRedirect}}, nil
 }
+
+// noRedirect stops the client at a redirect instead of following it. Zymple
+// never redirects, and following one would send the token along: to the same
+// host over plain http, for one.
+func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 func isLoopback(host string) bool {
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") {

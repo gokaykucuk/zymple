@@ -21,8 +21,11 @@ const (
 	DefaultKeepReleases  = 5
 	DefaultHealthTimeout = 60 * time.Second
 	DefaultDrain         = 30 * time.Second
-	DefaultPITRDays      = 14
-	maxFileSize          = 1 << 20
+	// DefaultReleaseTimeout bounds the release command. A command that never
+	// ends would otherwise hold the app's deploy lock for good.
+	DefaultReleaseTimeout = time.Hour
+	DefaultPITRDays       = 14
+	maxFileSize           = 1 << 20
 )
 
 var (
@@ -88,14 +91,17 @@ type Redis struct {
 
 // App is one validated app definition.
 type App struct {
-	Name         string    `yaml:"name"`
-	Domains      []string  `yaml:"domains"`
-	ComposeFile  string    `yaml:"compose"`
-	Web          Web       `yaml:"web"`
-	Release      []string  `yaml:"release"`
-	KeepReleases int       `yaml:"keep_releases"`
-	Postgres     *Postgres `yaml:"postgres"`
-	Redis        *Redis    `yaml:"redis"`
+	Name        string   `yaml:"name"`
+	Domains     []string `yaml:"domains"`
+	ComposeFile string   `yaml:"compose"`
+	Web         Web      `yaml:"web"`
+	Release     []string `yaml:"release"`
+	// ReleaseTimeout is how long the release command may run before the
+	// deploy is aborted.
+	ReleaseTimeout Duration  `yaml:"release_timeout"`
+	KeepReleases   int       `yaml:"keep_releases"`
+	Postgres       *Postgres `yaml:"postgres"`
+	Redis          *Redis    `yaml:"redis"`
 	// Env names the secrets file in the infra repo. On the host the file is
 	// always <dir>/env, so the value is accepted and ignored.
 	Env string `yaml:"env"`
@@ -188,6 +194,9 @@ func (a *App) applyDefaults() {
 	if a.Web.Healthcheck == "" {
 		a.Web.Healthcheck = "/"
 	}
+	if a.ReleaseTimeout == 0 {
+		a.ReleaseTimeout = Duration(DefaultReleaseTimeout)
+	}
 	if a.ComposeFile == "" {
 		a.ComposeFile = "compose.yml"
 	}
@@ -219,6 +228,9 @@ func (a *App) validate() error {
 		if arg == "" {
 			return errors.New("release command arguments must not be empty")
 		}
+	}
+	if t := time.Duration(a.ReleaseTimeout); t < time.Second || t > 24*time.Hour {
+		return errors.New("release_timeout must be between 1s and 24h")
 	}
 	if a.KeepReleases < 1 || a.KeepReleases > 50 {
 		return errors.New("keep_releases must be between 1 and 50")

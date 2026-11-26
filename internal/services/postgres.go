@@ -28,6 +28,7 @@ const (
 	labelConfig  = "zymple.config"
 	flagLabel    = "--label"
 	flagUser     = "--user"
+	flagFormat   = "--format"
 	envPGData    = "PGDATA="
 	rolePostgres = "postgres"
 	roleRedis    = "redis"
@@ -236,6 +237,15 @@ func (p *Postgres) Ensure(ctx context.Context, app *appdef.App) (string, error) 
 		}
 		return p.URL(app.Name)
 	}
+	if state != "" {
+		// The name alone does not say whose container this is; see
+		// RemoveDrill. Replacing it would destroy another app's cluster. A
+		// container that matched above carries this app's settings label,
+		// so only the path that removes one needs the check.
+		if labels := foreignLabels(ctx, p.Runner, name, app.Name, rolePostgres); labels != "" {
+			return "", fmt.Errorf("container %s is not the Postgres of app %s (it is labelled %q); not touching it", name, app.Name, labels)
+		}
+	}
 	if archive {
 		if err := p.writeConf(ctx, app, image, conf); err != nil {
 			return "", err
@@ -252,6 +262,7 @@ func (p *Postgres) Ensure(ctx context.Context, app *appdef.App) (string, error) 
 		"--network", appdef.Network(app.Name), "--network-alias", "postgres",
 		flagLabel, appdef.LabelApp + "=" + app.Name, flagLabel, appdef.LabelRole + "=" + rolePostgres,
 		flagLabel, labelConfig + "=" + want,
+		"--security-opt", "no-new-privileges:true",
 		"--shm-size", "256m",
 		// Read only when the image initialises an empty data directory. The
 		// password has no value here: Docker takes it from its environment.
@@ -292,6 +303,9 @@ func (p *Postgres) writeConf(ctx context.Context, app *appdef.App, image, conf s
 func (p *Postgres) afterStart(ctx context.Context, app *appdef.App, name, pw string) error {
 	p.setSettled(app.Name, false)
 	if err := p.waitReady(ctx, name); err != nil {
+		return err
+	}
+	if err := p.waitWritable(ctx, name); err != nil {
 		return err
 	}
 	if err := p.ensureRoles(ctx, app.Name, name, pw, app.Postgres.CreateRoles); err != nil {
@@ -402,6 +416,35 @@ func (p *Postgres) waitReady(ctx context.Context, name string) error {
 		}
 		if p.Now().After(deadline) {
 			return fmt.Errorf("postgres did not become ready: %w", err)
+		}
+		p.Sleep(ctx, readyInterval)
+	}
+}
+
+// recoverySQL asks whether the server is still replaying its archive.
+const recoverySQL = "SELECT pg_is_in_recovery()"
+
+// waitWritable waits until the server has left recovery. After a restore
+// Postgres accepts connections while it is still replaying WAL up to the
+// target, and is read-only until it promotes; setting up the roles in that
+// window fails. When the question cannot be asked at all the answer is left
+// to the role setup that follows, which reports why.
+func (p *Postgres) waitWritable(ctx context.Context, name string) error {
+	deadline := p.Now().Add(readyTimeout)
+	for {
+		out, err := p.psql(ctx, name, pgAdmin, adminDatabase, recoverySQL)
+		if err != nil {
+			// A cluster from before the role split has no postgres role.
+			out, err = p.psql(ctx, name, pgUser, adminDatabase, recoverySQL)
+		}
+		if err != nil || out != "t" {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if p.Now().After(deadline) {
+			return errors.New("postgres is still in recovery and read-only; it did not finish replaying its archive")
 		}
 		p.Sleep(ctx, readyInterval)
 	}
@@ -566,6 +609,7 @@ func (p *Postgres) Restore(ctx context.Context, app *appdef.App, opts RestoreOpt
 	args := []string{"run", "-d", "--name", name,
 		"--network", appdef.Network(app.Name), "--network-alias", "postgres-drill-" + opts.Into,
 		flagLabel, appdef.LabelApp + "=" + app.Name, flagLabel, appdef.LabelRole + "=" + roleDrill,
+		"--security-opt", "no-new-privileges:true",
 		"--shm-size", "256m", "-e", envPGData + pgData}
 	args = append(args, p.mounts(app.Name, dataDir)...)
 	args = append(args, image)
@@ -586,8 +630,7 @@ func (p *Postgres) RemoveDrill(ctx context.Context, app, drill string) error {
 	// "postgres" of app "a" and the live database of an app called
 	// "a-postgres-drill" are both "zymple-a-postgres-drill-postgres". Only a
 	// container Zymple labelled as this app's drill is removed.
-	owner, err := execx.Output(ctx, p.Runner, "docker", "inspect", "--format",
-		fmt.Sprintf(`{{index .Config.Labels %q}} {{index .Config.Labels %q}}`, appdef.LabelApp, appdef.LabelRole), name)
+	owner, err := execx.Output(ctx, p.Runner, "docker", "inspect", flagFormat, ownerFormat, name)
 	switch {
 	case err != nil && strings.Contains(strings.ToLower(err.Error()), "no such"):
 		// The container is already gone; its data may still be there.
@@ -606,7 +649,7 @@ func (p *Postgres) RemoveDrill(ctx context.Context, app, drill string) error {
 // inspect returns a container's state ("" if it does not exist) and its
 // configuration hash label.
 func inspect(ctx context.Context, r execx.Runner, name string) (state, hash string) {
-	out, err := execx.Output(ctx, r, "docker", "inspect", "--format",
+	out, err := execx.Output(ctx, r, "docker", "inspect", flagFormat,
 		fmt.Sprintf(`{{.State.Status}} {{index .Config.Labels %q}}`, labelConfig), name)
 	if err != nil {
 		return "", ""
@@ -619,6 +662,25 @@ func inspect(ctx context.Context, r execx.Runner, name string) (state, hash stri
 		hash = fields[1]
 	}
 	return fields[0], hash
+}
+
+// ownerFormat prints a container's app and role labels.
+var ownerFormat = fmt.Sprintf(`{{index .Config.Labels %q}} {{index .Config.Labels %q}}`, appdef.LabelApp, appdef.LabelRole)
+
+// foreignLabels returns the app and role labels of a container when they
+// say it is something other than the given app's container of that role,
+// and "" when it is that container, has no such labels, or does not exist.
+// A container Zymple did not label is left to the caller as before.
+func foreignLabels(ctx context.Context, r execx.Runner, name, app, role string) string {
+	out, err := execx.Output(ctx, r, "docker", "inspect", flagFormat, ownerFormat, name)
+	if err != nil {
+		return ""
+	}
+	labels := strings.Join(strings.Fields(out), " ")
+	if labels == "" || labels == app+" "+role {
+		return ""
+	}
+	return labels
 }
 
 func configHash(parts ...string) string {

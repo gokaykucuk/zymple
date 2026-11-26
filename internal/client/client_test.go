@@ -284,3 +284,24 @@ func TestPushFailures(t *testing.T) {
 		t.Errorf("push without a digest: %v", err)
 	}
 }
+
+// Regression: the client followed redirects with the token attached, and Go
+// keeps the header when the redirect stays on the same host, plain http
+// included.
+func TestTheTokenDoesNotFollowARedirect(t *testing.T) {
+	var followed bool
+	c := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/elsewhere" {
+			followed = true
+			return
+		}
+		http.Redirect(w, r, "/elsewhere", http.StatusFound)
+	})
+	err := c.JSON(context.Background(), http.MethodGet, "/api/v1/apps/shop/status", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 302") {
+		t.Errorf("a redirect was not reported as an error: %v", err)
+	}
+	if followed {
+		t.Error("the client followed the redirect")
+	}
+}

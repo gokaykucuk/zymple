@@ -161,6 +161,13 @@ Omit `--time` to restore to the latest archived state.
 
 ## Upgrading from a release before the hardening changes
 
+- The release command is now stopped after `release_timeout`, one hour
+  unless `app.yml` sets it (up to 24h). Set it before deploying an app whose
+  migrations can take longer.
+- `zymple redis restore <app>` now needs `--yes`.
+- CI must not push tags of the form `release-<n>`; the registry refuses
+  them. `zymple deploy --image` never did.
+
 - The first push of each app uploads every layer again. Blob ownership is
   now recorded per app and older images carry no record.
 - With backups configured, each Postgres container is replaced once, with a

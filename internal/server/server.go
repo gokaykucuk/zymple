@@ -27,6 +27,9 @@ import (
 	"github.com/gokaykucuk/zymple/internal/services"
 )
 
+// idleTimeout is how long a connection with no request on it is kept open.
+const idleTimeout = 2 * time.Minute
+
 // AppProxy is what the server needs from the reverse proxy.
 type AppProxy interface {
 	deploy.Proxy
@@ -84,7 +87,7 @@ func New(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Server, er
 		Proxy:  &proxy.Caddy{Dir: cfg.Caddy.SnippetsDir, Reload: cfg.Caddy.Reload, TLS: cfg.Caddy.TLS, Runner: runner},
 		Postgres: &services.Postgres{Runner: runner, Config: cfg, Sleep: deploy.SleepContext, Now: time.Now,
 			Warn: func(msg string) { log.Warn(msg) }},
-		Redis:    &services.Redis{Runner: runner, Config: cfg},
+		Redis:    &services.Redis{Runner: runner, Config: cfg, Sleep: deploy.SleepContext},
 		Registry: reg,
 	}
 	s.Engine = &deploy.Engine{
@@ -382,8 +385,10 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	servers := []*http.Server{
-		{Handler: s.NetworkHandler(), ReadHeaderTimeout: 15 * time.Second},
-		{Handler: s.AdminHandler(), ReadHeaderTimeout: 15 * time.Second},
+		// No read or write timeout: uploads and event streams are long. An
+		// idle connection is not, and without a limit it is kept for good.
+		{Handler: s.NetworkHandler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: idleTimeout},
+		{Handler: s.AdminHandler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: idleTimeout},
 	}
 	errc := make(chan error, 2)
 	go func() { errc <- servers[0].Serve(network) }()

@@ -93,6 +93,9 @@ publish nothing; apps reach them over the app's Docker network.
   listing, deleting and cross-repository mounts are refused. So is any path
   the registry would read as a repository nested under the app's own, such
   as `zymple/<app>/blobs/uploads/x`.
+- A push may not write a tag of the form `release-<n>`. Those are the tags
+  Zymple puts on kept releases; moving one would leave the image it named
+  without a name, and its content could be collected before a rollback.
 - A blob belongs to the repositories that uploaded its bytes. Existence
   checks and manifests see only the app's own blobs, so a manifest cannot
   name content another app pushed, even when the digest is known.
@@ -114,6 +117,7 @@ web:
   health_timeout: 60s         # default
   drain: 30s                  # default
 release: ["bin/migrate"]      # optional, runs before the switch
+release_timeout: 1h           # default; 1s to 24h
 keep_releases: 5              # default
 postgres: { version: 17, pitr_days: 14 }
 redis: { persistent: false }
@@ -208,8 +212,8 @@ Server side, per deploy:
 | verify | The digest exists in repository `zymple/<app>` | Reject |
 | | Take the app's deploy lock | HTTP 409 |
 | | Reserve a release number and a loopback port; start Postgres and Redis if they are not running | Abort |
-| release | Run `release` in a one-off container | Abort, remove the one-off container, old release untouched |
-| start | Start the new web container | Abort, remove it |
+| release | Run `release` in a one-off container, for at most `release_timeout` | Abort, remove the one-off container, old release untouched |
+| start | Start the new web container, within 10 minutes | Abort, remove it |
 | health | Poll the health check until `health_timeout` | Abort, remove it |
 | switch | Atomically replace the app's port file, which Caddy reads on every request | Abort |
 | | **Commit**: record the release as current | Switch back, abort |
@@ -219,7 +223,10 @@ Server side, per deploy:
 
 Until the commit the old release serves all traffic and a failure leaves
 nothing behind. After the commit the new release is live and nothing can fail
-the deploy. If the client disconnects, the deploy continues; `zymple status
+the deploy. The steps after the commit get the drain period plus 15 minutes
+between them; what is not done by then is reported and left to the next
+deploy or reload. Every step that runs a command is bounded, so a command
+that never returns cannot hold the app's deploy lock for good. If the client disconnects, the deploy continues; `zymple status
 <app>` reports the result.
 
 A release number is never reused, including by failed attempts.
@@ -318,8 +325,12 @@ message. Do not run `prune -a` on a Zymple host; Zymple prunes its own images.
   role, keeps the cluster working and logs a warning at every container start and
   once after each start of the Zymple server. To get
   the split, dump the database and restore it into a new cluster.
+- After a restore Postgres accepts connections while it is still replaying
+  WAL and is read-only. The role setup waits until it has left recovery.
 - A database container that has to be replaced is stopped first, with up to
-  two minutes to shut down cleanly.
+  two minutes to shut down cleanly. A container that has the database's name
+  but is labelled as something else, such as another app's drill cluster, is
+  not replaced; the deploy fails and says so.
 - Without a backup repository, Postgres runs with archiving off.
 
 Operator commands, on the host:
@@ -380,7 +391,10 @@ the import, because the import starts the app.
 
 - `persistent: false`: cache only, no volume, no backup.
 - `persistent: true`: AOF on a host directory, snapshotted daily to the
-  backup repository with restic. `zymple redis backup|restore <app>`. Redis
+  backup repository with restic. `zymple redis backup <app>` and
+  `zymple redis restore <app> --yes`. While the directory is copied Redis is
+  told not to rewrite its append-only file, and a rewrite already under way
+  is waited for, because a copy taken across a rewrite may not load. Redis
   is stopped for a restore and started again whether or not it succeeds.
 
 ## CLI summary
@@ -403,7 +417,8 @@ zymple reload
 zymple redeploy <app>
 zymple run <app> -- <command...>
 zymple pg info|backup|restore|psql|drill-rm <app>
-zymple redis backup|restore <app>
+zymple redis backup <app>
+zymple redis restore <app> --yes
 ```
 
 Anywhere: `zymple token generate <id>`, `zymple server`, `zymple version`.
@@ -427,7 +442,10 @@ the operator with Ansible.
   Its network input is limited to registry pushes and five API routes, all
   behind a per-app token.
 - A leaked app token can push images to that app, deploy and roll back that
-  app, and read its status and logs. It cannot read images or secrets, reach
+  app, and read its status and logs. An image it deploys runs as the app:
+  with the app's `env` file, its database and Redis, and its volumes. So a
+  token is worth as much as the app's own secrets and data, and has to be
+  kept like them. It cannot download images through the registry, reach
   other apps, or run commands on the host.
 - App definitions are untrusted input to the validator, but they are also
   reviewed in the infra repo. The compose allow-list is the second line of
@@ -518,4 +536,5 @@ Known limits:
    The release workflow's provenance attestation has not run either.
 4. **Long release commands.** A migration longer than CI's job timeout still
    completes on the server; CI has to learn the result from `zymple status`.
+   One longer than `release_timeout` (an hour unless set) is aborted.
 5. **Postgres major upgrades** are manual.

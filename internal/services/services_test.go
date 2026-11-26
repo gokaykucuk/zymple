@@ -96,6 +96,8 @@ func (c *capture) sql() string {
 // dockerState answers `docker inspect` with a container state and hash.
 type dockerState struct {
 	state, hash string
+	// owner is what the container's app and role labels say, "" for none.
+	owner string
 }
 
 func (s *dockerState) handler(extra func(execx.Cmd) (string, error, bool)) func(execx.Cmd) (string, error) {
@@ -105,10 +107,16 @@ func (s *dockerState) handler(extra func(execx.Cmd) (string, error, bool)) func(
 				return out, err
 			}
 		}
+		if strings.Contains(c.String(), "redis-cli CONFIG SET") {
+			return "OK\n", nil
+		}
 		switch c.Args[0] {
 		case "inspect":
 			if s.state == "" {
 				return "", errors.New("no such container")
+			}
+			if strings.Contains(c.String(), appdef.LabelRole) {
+				return s.owner + "\n", nil
 			}
 			return s.state + " " + s.hash + "\n", nil
 		case "run":
@@ -917,7 +925,13 @@ func TestLegacyClusterGainsASuperuserAndWarns(t *testing.T) {
 	hasPostgres := false
 	fake.Handler = rec.wrap(st.handler(func(c execx.Cmd) (string, error, bool) {
 		line := c.String()
+		rec.mu.Lock()
+		asksRecovery := rec.stdin[len(rec.stdin)-1] == recoverySQL
+		rec.mu.Unlock()
 		switch {
+		case asksRecovery:
+			// Not in recovery, whichever role asks.
+			return "f\n", nil, true
 		case strings.Contains(line, "psql -U postgres") && !hasPostgres:
 			return "", errors.New(`role "postgres" does not exist`), true
 		case strings.Contains(line, "psql -U app"):
@@ -1051,7 +1065,7 @@ func TestEnsureSetsUpARunningClusterOncePerProcess(t *testing.T) {
 	for sub, want := range map[string]int{
 		"docker inspect":                2 + 1, // one per Ensure, one in waitReady
 		"pg_isready":                    1,
-		"psql -U postgres -d postgres ": 2,
+		"psql -U postgres -d postgres ": 3, // the recovery check, then two for the roles
 		"psql -U postgres -d app ":      1,
 		"stanza-create":                 1,
 	} {
@@ -1149,6 +1163,227 @@ func FuzzRestoreOptions(f *testing.F) {
 			t.Fatalf("drill container name %q", name)
 		}
 	})
+}
+
+// Regression: a backup copied the data directory while Redis could rewrite
+// its append-only file, and a copy taken across a rewrite may not load.
+func TestRedisBackupPausesRewrites(t *testing.T) {
+	app := testApp(t, "redis: { persistent: true }\n")
+	var out bytes.Buffer
+	rewriting, slept := 1, 0
+	fake := &execxtest.Fake{}
+	fake.Handler = func(c execx.Cmd) (string, error) {
+		line := c.String()
+		switch {
+		case strings.Contains(line, "redis-cli CONFIG SET"):
+			return "OK\n", nil
+		case strings.Contains(line, "redis-cli INFO persistence"):
+			if rewriting > 0 {
+				rewriting--
+				return "aof_enabled:1\naof_rewrite_in_progress:1\n", nil
+			}
+			return "aof_enabled:1\naof_rewrite_in_progress:0\n", nil
+		}
+		return "", nil
+	}
+	r := &Redis{Runner: fake, Config: testConfig(t, "posix"), Sleep: func(context.Context, time.Duration) { slept++ }}
+	if err := r.Backup(ctx, app, &out); err != nil {
+		t.Fatal(err)
+	}
+	calls := strings.Join(fake.Calls(), "\n")
+	pause := strings.Index(calls, "docker exec zymple-shop-redis redis-cli CONFIG SET auto-aof-rewrite-percentage 0")
+	backup := strings.Index(calls, "backup /data")
+	resume := strings.Index(calls, "redis-cli CONFIG SET auto-aof-rewrite-percentage 100")
+	if pause < 0 || !(pause < backup && backup < resume) {
+		t.Errorf("rewrites were not paused around the copy:\n%s", calls)
+	}
+	if fake.Count("INFO persistence") != 2 || slept != 1 {
+		t.Errorf("a running rewrite was not waited for: %d checks, %d sleeps", fake.Count("INFO persistence"), slept)
+	}
+
+	// A rewrite that never ends, or a Redis that cannot be asked, fails the
+	// backup, copies nothing, and lets rewrites go on.
+	for name, info := range map[string]func() (string, error){
+		"endless rewrite": func() (string, error) { return "aof_rewrite_in_progress:1\n", nil },
+		"info fails":      func() (string, error) { return "", errors.New("injected") },
+	} {
+		fake.Reset()
+		fake.Handler = func(c execx.Cmd) (string, error) {
+			switch {
+			case strings.Contains(c.String(), "CONFIG SET"):
+				return "OK\n", nil
+			case strings.Contains(c.String(), "INFO persistence"):
+				return info()
+			}
+			return "", nil
+		}
+		if err := r.Backup(ctx, app, &out); err == nil {
+			t.Errorf("%s: the backup reported no error", name)
+		}
+		if fake.Count("backup /data") != 0 || fake.Count("auto-aof-rewrite-percentage 100") != 1 {
+			t.Errorf("%s: wrong commands: %v", name, fake.Calls())
+		}
+	}
+
+	// Redis runs but refuses the setting: no copy.
+	fake.Reset()
+	fake.Handler = func(c execx.Cmd) (string, error) {
+		switch {
+		case strings.Contains(c.String(), "CONFIG SET"):
+			return "", errors.New("refused")
+		case c.Args[0] == "inspect":
+			return "running x\n", nil
+		}
+		return "", nil
+	}
+	if err := r.Backup(ctx, app, &out); err == nil || fake.Count("backup /data") != 0 {
+		t.Errorf("a refused pause: %v, %v", err, fake.Calls())
+	}
+
+	// A stopped Redis writes nothing; its files are copied as they are.
+	fake.Reset()
+	fake.Handler = func(c execx.Cmd) (string, error) {
+		switch {
+		case strings.Contains(c.String(), "CONFIG SET"):
+			return "", errors.New("container is not running")
+		case c.Args[0] == "inspect":
+			return "exited x\n", nil
+		}
+		return "", nil
+	}
+	if err := r.Backup(ctx, app, &out); err != nil || fake.Count("backup /data") != 1 {
+		t.Errorf("backup of a stopped Redis: %v, %v", err, fake.Calls())
+	}
+
+	// Without a Sleep the wait is a timer that a cancelled context ends.
+	plain := &Redis{}
+	plain.sleep(ctx, time.Millisecond)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	plain.sleep(cancelled, time.Hour)
+}
+
+// Regression: Ensure replaced whatever container had the Postgres name. The
+// drill "postgres" of app "a" has the name of the database of an app called
+// "a-postgres-drill", so a deploy of one removed the other's cluster.
+func TestEnsureLeavesAnotherAppsContainerAlone(t *testing.T) {
+	app := testApp(t, "postgres: { version: 17 }\n")
+	st := &dockerState{state: "running", hash: "other", owner: "sho postgres-drill"}
+	fake := &execxtest.Fake{Handler: st.handler(nil)}
+	p := newPostgres(t, "", fake)
+	if _, err := p.Ensure(ctx, app); err == nil || !strings.Contains(err.Error(), "not the Postgres of app shop") {
+		t.Fatalf("error = %v", err)
+	}
+	if fake.Count("docker stop") != 0 || fake.Count("docker rm") != 0 || fake.Count("docker run") != 0 {
+		t.Errorf("another app's container was touched: %v", fake.Calls())
+	}
+	// Its own container, and one from before the labels existed, are
+	// replaced as before.
+	for _, owner := range []string{"shop postgres", ""} {
+		st := &dockerState{state: "running", hash: "old", owner: owner}
+		fake := &execxtest.Fake{Handler: st.handler(nil)}
+		if _, err := newPostgres(t, "", fake).Ensure(ctx, app); err != nil {
+			t.Errorf("owner %q: %v", owner, err)
+		}
+		if fake.Count("docker rm") != 1 {
+			t.Errorf("owner %q: the container was not replaced: %v", owner, fake.Calls())
+		}
+	}
+	if got := foreignLabels(ctx, &execxtest.Fake{Handler: (&dockerState{}).handler(nil)}, "x", "shop", rolePostgres); got != "" {
+		t.Errorf("a missing container has labels %q", got)
+	}
+}
+
+func TestDatabaseContainersCannotGainPrivileges(t *testing.T) {
+	app := testApp(t, "postgres: { version: 17 }\n")
+	fake := &execxtest.Fake{Handler: (&dockerState{}).handler(nil)}
+	p := newPostgres(t, "posix", fake)
+	if _, err := p.Ensure(ctx, app); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := p.Restore(ctx, app, RestoreOptions{Into: "d"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"--name zymple-shop-postgres ", "--name zymple-shop-postgres-drill-d "} {
+		if cmd := fake.Find(name); !strings.Contains(cmd, "--security-opt no-new-privileges:true") {
+			t.Errorf("no-new-privileges missing: %s", cmd)
+		}
+	}
+}
+
+// Regression, found by the end-to-end suite on a fast machine: after a
+// point-in-time restore Postgres accepts connections while it still replays
+// WAL and is read-only, and the role setup ran in that window and failed
+// with "cannot execute ALTER ROLE in a read-only transaction".
+func TestRoleSetupWaitsForRecoveryToEnd(t *testing.T) {
+	app := testApp(t, "postgres: { version: 17 }\n")
+	run := func(inRecovery func(asked int) (string, error)) (*capture, error) {
+		st := &dockerState{state: "running"}
+		rec := &capture{}
+		asked := 0
+		fake := &execxtest.Fake{}
+		fake.Handler = rec.wrap(st.handler(func(c execx.Cmd) (string, error, bool) {
+			rec.mu.Lock()
+			sql := rec.stdin[len(rec.stdin)-1]
+			rec.mu.Unlock()
+			if sql != recoverySQL {
+				return "", nil, false
+			}
+			asked++
+			out, err := inRecovery(asked)
+			return out, err, true
+		}))
+		var out bytes.Buffer
+		return rec, newPostgres(t, "posix", fake).Restore(ctx, app, RestoreOptions{Time: "2026-01-02 15:04:05+00"}, &out)
+	}
+
+	rec, err := run(func(asked int) (string, error) {
+		if asked < 3 {
+			return "t\n", nil
+		}
+		return "f\n", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := rec.sql()
+	if strings.Count(sql, recoverySQL) != 3 {
+		t.Errorf("recovery was asked about %d times, want 3", strings.Count(sql, recoverySQL))
+	}
+	if last, alter := strings.LastIndex(sql, recoverySQL), strings.Index(sql, "ALTER ROLE"); alter < 0 || alter < last {
+		t.Errorf("the roles were set up before recovery ended:\n%s", sql)
+	}
+
+	// A server that never leaves recovery fails the restore and gets no
+	// role setup at all.
+	rec, err = run(func(int) (string, error) { return "t\n", nil })
+	if err == nil || !strings.Contains(err.Error(), "still in recovery") {
+		t.Errorf("error = %v", err)
+	}
+	if strings.Contains(rec.sql(), "ALTER ROLE") {
+		t.Error("roles were set up on a read-only server")
+	}
+
+	// When the question cannot be asked, role setup goes ahead and reports.
+	rec, err = run(func(int) (string, error) { return "", errors.New("injected") })
+	if err != nil || !strings.Contains(rec.sql(), "ALTER ROLE") {
+		t.Errorf("an unanswerable recovery check blocked the setup: %v", err)
+	}
+
+	// Cancellation ends the wait.
+	st := &dockerState{state: "running"}
+	fake := &execxtest.Fake{Handler: st.handler(func(c execx.Cmd) (string, error, bool) {
+		if strings.Contains(c.String(), "psql") {
+			return "t\n", nil, true
+		}
+		return "", nil, false
+	})}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := newPostgres(t, "", fake).waitWritable(cancelled, "x"); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled wait: %v", err)
+	}
 }
 
 func TestPostgresCreateRolesIsAppliedBothWays(t *testing.T) {

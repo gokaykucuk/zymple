@@ -207,6 +207,43 @@ func TestBlobWriter(t *testing.T) {
 	}
 }
 
+// Regression: every request of an upload made a lease of its own, and all
+// but the last were left behind for a day.
+func TestAnUploadInSeveralRequestsKeepsOneLease(t *testing.T) {
+	repo, _, stores := newRepo(t)
+	blobs := repo.Blobs(ctx)
+	before := leaseCount(t, stores)
+	w, err := blobs.Create(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := w.ID()
+	parts := []string{"first ", "second ", "third"}
+	for i, part := range parts {
+		if _, err := w.Write([]byte(part)); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// A status request in between must not add a lease either.
+		if w, err = blobs.Resume(ctx, id); err != nil {
+			t.Fatalf("resume after part %d: %v", i, err)
+		}
+	}
+	dgst := digest.FromString(strings.Join(parts, ""))
+	if _, err := w.Commit(ctx, v1.Descriptor{Digest: dgst}); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	if grew := leaseCount(t, stores) - before; grew != 1 {
+		t.Errorf("an upload in %d requests left %d leases, want 1", len(parts)+1, grew)
+	}
+	if _, err := blobs.Stat(ctx, dgst); err != nil {
+		t.Errorf("the committed blob is not there: %v", err)
+	}
+}
+
 func TestManifestsAndTags(t *testing.T) {
 	repo, _, stores := newRepo(t)
 	blobs := repo.Blobs(ctx)

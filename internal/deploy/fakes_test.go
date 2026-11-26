@@ -40,6 +40,8 @@ type world struct {
 	nextPort int
 	released []int
 	slept    []time.Duration
+	// releaseHangs makes the release command run until it is cancelled.
+	releaseHangs bool
 }
 
 func newWorld() *world {
@@ -162,9 +164,20 @@ func (w *world) RemoveCompose(_ string, release int) error {
 	return err
 }
 
-func (w *world) RunRelease(_ context.Context, _ *appdef.App, release int, out io.Writer) error {
+func (w *world) RunRelease(ctx context.Context, _ *appdef.App, release int, out io.Writer) error {
 	fmt.Fprint(out, "migrating\nstill migrating\r\npartial")
-	return w.op("RunRelease", release)
+	if err := w.op("RunRelease", release); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	hangs := w.releaseHangs
+	w.mu.Unlock()
+	if hangs {
+		// Like a killed docker client: it returns only when its context ends.
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return nil
 }
 
 func (w *world) StartWeb(_ context.Context, _ *appdef.App, release int, _ io.Writer) error {

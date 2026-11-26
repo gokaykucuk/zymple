@@ -54,22 +54,51 @@ func newBlobWriter(ctx context.Context, blobs *blobStore, id string) (*blobWrite
 	}
 	ctx = reg.ctx(ctx)
 	manager := reg.stores.LeasesService()
-	lease, err := manager.Create(ctx, leases.WithRandomID(), leases.WithExpiration(leaseExpiration))
+	lease, created, err := uploadLease(ctx, manager, id)
 	if err != nil {
 		return nil, fmt.Errorf("create containerd lease: %w", err)
 	}
+	// Only a lease this request made is given up when the request fails. One
+	// that an earlier request of the same upload made still holds its data.
+	giveUp := func() {
+		if created {
+			_ = manager.Delete(ctx, lease)
+		}
+	}
 	writer, err := content.OpenWriter(leases.WithLease(ctx, lease.ID), reg.stores.ContentStore(), content.WithRef(uploadRef(id)))
 	if err != nil {
-		_ = manager.Delete(ctx, lease)
+		giveUp()
 		return nil, fmt.Errorf("open containerd content writer: %w", err)
 	}
 	status, err := writer.Status()
 	if err != nil {
 		_ = writer.Close()
-		_ = manager.Delete(ctx, lease)
+		giveUp()
 		return nil, fmt.Errorf("read containerd content writer status: %w", err)
 	}
 	return &blobWriter{reg: reg, blobs: blobs, id: id, lease: lease, writer: writer, size: status.Offset}, nil
+}
+
+// uploadLease returns the lease of an upload, creating it for the upload's
+// first request. An upload sent in several requests keeps the one lease: a
+// lease per request would leave each of them behind until it expired.
+func uploadLease(ctx context.Context, manager leases.Manager, id string) (lease leases.Lease, created bool, err error) {
+	leaseID := "zymple-upload-" + id
+	lease, err = manager.Create(ctx, leases.WithID(leaseID), leases.WithExpiration(leaseExpiration))
+	if err == nil {
+		return lease, true, nil
+	}
+	if !errdefs.IsAlreadyExists(err) {
+		return leases.Lease{}, false, err
+	}
+	list, err := manager.List(ctx, "id=="+leaseID)
+	if err != nil {
+		return leases.Lease{}, false, err
+	}
+	if len(list) == 0 {
+		return leases.Lease{}, false, fmt.Errorf("the lease of upload %s expired", id)
+	}
+	return list[0], false, nil
 }
 
 func (w *blobWriter) ID() string           { return w.id }

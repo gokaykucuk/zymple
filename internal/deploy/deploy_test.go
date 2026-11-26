@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/gokaykucuk/zymple/internal/appdef"
 	"github.com/gokaykucuk/zymple/internal/releases"
 	"github.com/gokaykucuk/zymple/internal/runtime"
 )
@@ -911,6 +912,42 @@ func TestAbortRemovesTheReleaseCommand(t *testing.T) {
 				t.Error("a one-off of the live release was removed")
 			}
 		})
+	}
+}
+
+// Failure injection: the release command never returns. Without a limit it
+// held the app's lock for good, and no deploy, rollback or restore could run
+// until the daemon was restarted.
+func TestAHangingReleaseCommandIsAborted(t *testing.T) {
+	w := newWorld()
+	e := newEngine(t, w)
+	mustDeploy(t, e, w, digestA)
+	app := testApp(t, "")
+	app.ReleaseTimeout = appdef.Duration(20 * time.Millisecond)
+	w.releaseHangs = true
+	w.hook["RunRelease"] = func() { w.addOneOff("migrate", 2) }
+	_, err := e.Deploy(ctx, app, digestB, "ci", nil)
+	if err == nil || !strings.Contains(err.Error(), "the release command did not finish within 20ms") {
+		t.Fatalf("error = %v, want the release timeout", err)
+	}
+	if w.hasOneOff("migrate") {
+		t.Error("the hanging release command was left running")
+	}
+	if got := w.runningWebs(); len(got) != 1 || got[0] != 1 {
+		t.Errorf("running webs = %v, want the old release only", got)
+	}
+	if e.Busy("shop") {
+		t.Error("the app is still locked")
+	}
+	w.releaseHangs = false
+	if _, err := e.Deploy(ctx, testApp(t, ""), digestB, "ci", nil); err != nil {
+		t.Errorf("the next deploy failed: %v", err)
+	}
+}
+
+func TestReleaseTimeoutFallsBackToTheDefault(t *testing.T) {
+	if got := releaseTimeout(&appdef.App{}); got != appdef.DefaultReleaseTimeout {
+		t.Errorf("release timeout of an app without one = %s", got)
 	}
 }
 
