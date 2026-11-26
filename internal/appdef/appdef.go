@@ -284,6 +284,14 @@ func Load(dir string) (*App, error) {
 // LoadAll reads every app directory under root. A broken definition does not
 // hide the others: valid apps are returned together with the joined errors.
 func LoadAll(root string) (map[string]*App, error) {
+	return LoadAllPreferring(root, nil)
+}
+
+// LoadAllPreferring is LoadAll, but directories for which incumbent reports
+// true are loaded first. Two apps that claim one domain cannot both load, and
+// the first one loaded keeps it, so an app that is already serving wins the
+// conflict against a newcomer whatever their names sort as.
+func LoadAllPreferring(root string, incumbent func(name string) bool) (map[string]*App, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, err
@@ -291,14 +299,7 @@ func LoadAll(root string) (map[string]*App, error) {
 	apps := make(map[string]*App)
 	var errs []error
 	domains := make(map[string]string)
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	for _, name := range loadOrder(entries, incumbent) {
 		app, err := Load(filepath.Join(root, name))
 		if err != nil {
 			errs = append(errs, fmt.Errorf("app %s: %w", name, err))
@@ -314,6 +315,25 @@ func LoadAll(root string) (map[string]*App, error) {
 		apps[name] = app
 	}
 	return apps, errors.Join(errs...)
+}
+
+// loadOrder returns the directory names with the incumbents first, each
+// group in sorted order.
+func loadOrder(entries []os.DirEntry, incumbent func(name string) bool) []string {
+	var first, rest []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if incumbent != nil && incumbent(e.Name()) {
+			first = append(first, e.Name())
+		} else {
+			rest = append(rest, e.Name())
+		}
+	}
+	sort.Strings(first)
+	sort.Strings(rest)
+	return append(first, rest...)
 }
 
 func firstClaimed(domains map[string]string, app *App) string {

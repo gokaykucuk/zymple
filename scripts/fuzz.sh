@@ -15,4 +15,5 @@ FuzzAuthorize ./internal/registry
 FuzzValidDigest ./internal/deploy
 FuzzManifestPut ./internal/registry/containerdstore
 FuzzRestoreOptions ./internal/services
+FuzzParseReleaseTag ./internal/runtime
 TARGETS

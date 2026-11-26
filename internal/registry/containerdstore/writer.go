@@ -58,7 +58,7 @@ func newBlobWriter(ctx context.Context, blobs *blobStore, id string) (*blobWrite
 	if err != nil {
 		return nil, fmt.Errorf("create containerd lease: %w", err)
 	}
-	writer, err := content.OpenWriter(leases.WithLease(ctx, lease.ID), reg.stores.ContentStore(), content.WithRef("upload-"+id))
+	writer, err := content.OpenWriter(leases.WithLease(ctx, lease.ID), reg.stores.ContentStore(), content.WithRef(uploadRef(id)))
 	if err != nil {
 		_ = manager.Delete(ctx, lease)
 		return nil, fmt.Errorf("open containerd content writer: %w", err)
@@ -101,6 +101,14 @@ func (w *blobWriter) Write(data []byte) (int, error) {
 func (w *blobWriter) Commit(ctx context.Context, desc v1.Descriptor) (v1.Descriptor, error) {
 	ctx = w.reg.ctx(ctx)
 	manager := w.reg.stores.LeasesService()
+	// Compare what was uploaded with what is claimed before asking containerd
+	// to commit. Its content service answers "already exists" for a digest
+	// the host has without looking at the uploaded bytes, and that answer
+	// must never be taken as proof that the client holds the content.
+	if err := w.matches(desc); err != nil {
+		w.abandon(ctx)
+		return v1.Descriptor{}, distribution.ErrBlobInvalidDigest{Digest: desc.Digest, Reason: err}
+	}
 	if err := w.writer.Commit(ctx, w.size, desc.Digest); err != nil {
 		switch {
 		case errdefs.IsAlreadyExists(err):
@@ -132,6 +140,28 @@ func (w *blobWriter) Commit(ctx context.Context, desc v1.Descriptor) (v1.Descrip
 	}
 	return desc, nil
 }
+
+// matches reports whether the bytes received so far are the content desc
+// names. The writer's digest covers everything in the upload, including
+// chunks sent in earlier requests.
+func (w *blobWriter) matches(desc v1.Descriptor) error {
+	if actual := w.writer.Digest(); actual != desc.Digest {
+		return fmt.Errorf("uploaded content is %s", actual)
+	}
+	if desc.Size > 0 && desc.Size != w.size {
+		return fmt.Errorf("uploaded content is %d bytes, not %d", w.size, desc.Size)
+	}
+	return nil
+}
+
+// abandon discards the upload and its lease.
+func (w *blobWriter) abandon(ctx context.Context) {
+	_ = w.writer.Close()
+	_ = w.reg.stores.ContentStore().Abort(ctx, uploadRef(w.id))
+	_ = w.reg.stores.LeasesService().Delete(ctx, w.lease)
+}
+
+func uploadRef(id string) string { return "upload-" + id }
 
 // Cancel abandons the upload.
 func (w *blobWriter) Cancel(ctx context.Context) error {

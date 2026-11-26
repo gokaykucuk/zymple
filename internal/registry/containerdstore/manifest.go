@@ -7,10 +7,11 @@ import (
 	"fmt"
 
 	"github.com/distribution/distribution/v3"
-	// These packages register the manifest formats UnmarshalManifest knows.
-	_ "github.com/distribution/distribution/v3/manifest/manifestlist"
-	_ "github.com/distribution/distribution/v3/manifest/ocischema"
-	_ "github.com/distribution/distribution/v3/manifest/schema2"
+	// Importing these packages also registers the manifest formats
+	// UnmarshalManifest knows.
+	"github.com/distribution/distribution/v3/manifest/manifestlist"
+	"github.com/distribution/distribution/v3/manifest/ocischema"
+	"github.com/distribution/distribution/v3/manifest/schema2"
 	"github.com/distribution/distribution/v3/registry/api/errcode"
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
@@ -61,6 +62,9 @@ func (m *manifestService) Put(ctx context.Context, manifest distribution.Manifes
 	if err != nil {
 		return "", fmt.Errorf("store manifest: %w", err)
 	}
+	if err := m.blobs.label(ctx, desc.Digest, manifestLabel(m.repo.Name())); err != nil {
+		return "", err
+	}
 	return desc.Digest, nil
 }
 
@@ -70,6 +74,10 @@ func (m *manifestService) verify(ctx context.Context, manifest distribution.Mani
 	}
 	if err := json.Unmarshal(payload, &header); err != nil || header.SchemaVersion != 2 {
 		return errcode.ErrorCodeManifestInvalid.WithDetail("schemaVersion must be 2")
+	}
+	index, known := isIndex(manifest)
+	if !known {
+		return errcode.ErrorCodeManifestInvalid.WithDetail("unsupported manifest type")
 	}
 	refs := manifest.References()
 	if len(refs) == 0 {
@@ -84,19 +92,13 @@ func (m *manifestService) verify(ctx context.Context, manifest distribution.Mani
 	}
 	var missing distribution.ErrManifestVerification
 	for _, ref := range refs {
-		if err := ref.Digest.Validate(); err != nil {
-			missing = append(missing, distribution.ErrManifestBlobUnknown{Digest: ref.Digest})
-			continue
-		}
-		// Stat only knows blobs that were pushed to this repository, so a
-		// manifest cannot adopt content that belongs to another app.
-		_, err := m.blobs.Stat(ctx, ref.Digest)
-		switch {
-		case errors.Is(err, distribution.ErrBlobUnknown):
-			missing = append(missing, distribution.ErrManifestBlobUnknown{Digest: ref.Digest})
-		case err != nil:
+		ok, err := m.usable(ctx, ref, index)
+		if err != nil {
 			release()
 			return err
+		}
+		if !ok {
+			missing = append(missing, distribution.ErrManifestBlobUnknown{Digest: ref.Digest})
 		}
 	}
 	if len(missing) > 0 {
@@ -104,6 +106,52 @@ func (m *manifestService) verify(ctx context.Context, manifest distribution.Mani
 		return missing
 	}
 	return nil
+}
+
+// usable reports whether a manifest in this repository may reference ref.
+//
+// An index may only name manifests this service verified and stored for the
+// repository. Otherwise the JSON of a manifest that points at another app's
+// layers could be uploaded as an ordinary blob, where nothing checks it, and
+// then be reached through an index.
+//
+// An image manifest may only name blobs that were pushed to the repository,
+// and none of them as a manifest: what interprets the image later follows
+// the media type written here, not the one the content was checked as.
+func (m *manifestService) usable(ctx context.Context, ref v1.Descriptor, index bool) (bool, error) {
+	if ref.Digest.Validate() != nil {
+		return false, nil
+	}
+	if index {
+		return m.blobs.isManifest(ctx, ref.Digest)
+	}
+	if manifestMediaTypes[ref.MediaType] {
+		return false, nil
+	}
+	_, err := m.blobs.Stat(ctx, ref.Digest)
+	if errors.Is(err, distribution.ErrBlobUnknown) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+var manifestMediaTypes = map[string]bool{
+	v1.MediaTypeImageManifest:          true,
+	v1.MediaTypeImageIndex:             true,
+	schema2.MediaTypeManifest:          true,
+	manifestlist.MediaTypeManifestList: true,
+}
+
+// isIndex tells an index from an image manifest. Any other kind of manifest
+// is not known and is refused.
+func isIndex(manifest distribution.Manifest) (index, known bool) {
+	switch manifest.(type) {
+	case *manifestlist.DeserializedManifestList, *ocischema.DeserializedImageIndex:
+		return true, true
+	case *schema2.DeserializedManifest, *ocischema.DeserializedManifest:
+		return false, true
+	}
+	return false, false
 }
 
 // Delete is not supported.

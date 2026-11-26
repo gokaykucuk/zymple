@@ -222,6 +222,23 @@ var escapeAttempts = map[string]string{
 	"user list":                          "services:\n  web:\n    image: ${IMAGE}\n    user: [root]\n",
 	"user bool":                          "services:\n  web:\n    image: ${IMAGE}\n    user: true\n",
 	"user float":                         "services:\n  web:\n    image: ${IMAGE}\n    user: 1e3\n",
+	"user yaml octal":                    "services:\n  web:\n    image: ${IMAGE}\n    user: 01000\n",
+	"user yaml hex":                      "services:\n  web:\n    image: ${IMAGE}\n    user: 0x3E8\n",
+	"user yaml new octal":                "services:\n  web:\n    image: ${IMAGE}\n    user: 0o17\n",
+	"user yaml binary":                   "services:\n  web:\n    image: ${IMAGE}\n    user: 0b11\n",
+	"user yaml signed":                   "services:\n  web:\n    image: ${IMAGE}\n    user: +1\n",
+	"user yaml underscore":               "services:\n  web:\n    image: ${IMAGE}\n    user: 1_000\n",
+	"user yaml octal with group":         "services:\n  web:\n    image: ${IMAGE}\n    user: 01000:5\n",
+	"user null":                          "services:\n  web:\n    image: ${IMAGE}\n    user: null\n",
+	"user tilde":                         "services:\n  web:\n    image: ${IMAGE}\n    user: ~\n",
+	"user blank":                         "services:\n  web:\n    image: ${IMAGE}\n    user:\n",
+	"user tagged binary":                 "services:\n  web:\n    image: ${IMAGE}\n    user: !!binary cm9vdA==\n",
+	"user tagged string zero":            "services:\n  web:\n    image: ${IMAGE}\n    user: !!str 0\n",
+	"user uid above docker limit":        "services:\n  web:\n    image: ${IMAGE}\n    user: \"2147483648\"\n",
+	"user uid above limit unquoted":      "services:\n  web:\n    image: ${IMAGE}\n    user: 2147483648\n",
+	"user uid 32-bit max":                "services:\n  web:\n    image: ${IMAGE}\n    user: \"4294967295\"\n",
+	"user gid above docker limit":        "services:\n  web:\n    image: ${IMAGE}\n    user: \"1000:2147483648\"\n",
+	"user gid 32-bit max":                "services:\n  web:\n    image: ${IMAGE}\n    user: \"1000:4294967295\"\n",
 	"non-string key hides interpolation": "services:\n  web:\n    image: ${IMAGE}\n    healthcheck:\n      1: x\n      test: [\"CMD\", \"${HOME}\"]\n",
 	"non-string key in a list":           "services:\n  web:\n    image: ${IMAGE}\n    command: [{ 1: x }]\n",
 	"empty document":                     "",
@@ -237,9 +254,50 @@ func TestComposeEscapeAttemptsAreRejected(t *testing.T) {
 }
 
 func TestUserAllowList(t *testing.T) {
-	for _, user := range []string{`1000`, `"1000"`, `"1000:1000"`, `"1000:0"`, `nobody`, `"app:app"`, `"_svc:100"`, `"4294967295"`} {
-		if _, err := ParseCompose([]byte("services:\n  web:\n    image: ${IMAGE}\n    user: " + user + "\n")); err != nil {
+	for _, user := range []string{`1000`, `"1000"`, `'1000'`, `"1000:1000"`, `"1000:0"`, `1000:1000`, `nobody`, `"app:app"`, `"_svc:100"`,
+		`1`, `2147483647`, `"2147483647"`, `"2147483647:2147483647"`, `"app:2147483647"`} {
+		c, err := ParseCompose([]byte("services:\n  web:\n    image: ${IMAGE}\n    user: " + user + "\n"))
+		if err != nil {
 			t.Errorf("user %s was refused: %v", user, err)
+			continue
+		}
+		if got, want := c.Services["web"]["user"], strings.Trim(user, `"'`); got != want {
+			t.Errorf("user %s is kept as %#v, want the string %q", user, got, want)
+		}
+	}
+}
+
+// Regression: an unquoted user was decoded by YAML before it was checked, so
+// 01000 passed as 512 and 0x3E8 as 1000. The text in the file is what is
+// checked, and it is what the rendered file carries, as a string.
+func TestUserIsCheckedAndRenderedAsWritten(t *testing.T) {
+	const app = "name: shop\ndomains: [a.example.com]\nweb: { service: web, port: 80 }\n"
+	compose := func(user string) []byte {
+		return []byte("services:\n  web:\n    image: ${IMAGE}\n    user: " + user + "\n")
+	}
+	for _, user := range []string{"01000", "0x3E8", "0o17", "0b11", "+1", "1_000"} {
+		if c, err := ParseCompose(compose(user)); err == nil {
+			t.Errorf("user %s was accepted as %#v", user, c.Services["web"]["user"])
+		}
+	}
+	for _, user := range []string{"1000", `"1000:0"`, "2147483647"} {
+		parsed, err := Parse([]byte(app), compose(user))
+		if err != nil {
+			t.Fatalf("user %s was refused: %v", user, err)
+		}
+		parsed.Dir = t.TempDir()
+		out, err := parsed.Render(RenderInput{Release: 1, Digest: "sha256:" + strings.Repeat("c", 64), Port: 20000})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc struct {
+			Services map[string]map[string]any `yaml:"services"`
+		}
+		if err := yaml.Unmarshal(out, &doc); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := doc.Services["web-r1"]["user"], strings.Trim(user, `"`); got != want {
+			t.Errorf("user %s is rendered as %#v, want the string %q:\n%s", user, got, want, out)
 		}
 	}
 }
@@ -430,6 +488,40 @@ func TestLoadAll(t *testing.T) {
 	}
 }
 
+// Regression: apps load in name order, so a new app whose name sorted first
+// took a domain away from the app already serving it.
+func TestLoadAllPreferringKeepsTheIncumbent(t *testing.T) {
+	root := t.TempDir()
+	simple := func(name string) string {
+		return "name: " + name + "\ndomains: [shop.example.com]\nweb: { service: web, port: 80 }\n"
+	}
+	compose := "services:\n  web:\n    image: ${IMAGE}\n"
+	writeApp(t, root, "aaa", simple("aaa"), compose)
+	writeApp(t, root, "shop", simple("shop"), compose)
+
+	apps, err := LoadAllPreferring(root, func(name string) bool { return name == "shop" })
+	if len(apps) != 1 || apps["shop"] == nil {
+		t.Fatalf("want only the incumbent shop loaded, got %v", apps)
+	}
+	if err == nil || !strings.Contains(err.Error(), "app aaa: a domain is already used by app shop") {
+		t.Errorf("the newcomer was not reported: %v", err)
+	}
+
+	for name, load := range map[string]func() (map[string]*App, error){
+		"LoadAll":             func() (map[string]*App, error) { return LoadAll(root) },
+		"nil preference":      func() (map[string]*App, error) { return LoadAllPreferring(root, nil) },
+		"no incumbent at all": func() (map[string]*App, error) { return LoadAllPreferring(root, func(string) bool { return false }) },
+	} {
+		apps, err := load()
+		if len(apps) != 1 || apps["aaa"] == nil {
+			t.Errorf("%s: want name order to hold and aaa loaded, got %v", name, apps)
+		}
+		if err == nil || !strings.Contains(err.Error(), "app shop: a domain is already used by app aaa") {
+			t.Errorf("%s: shop was not reported: %v", name, err)
+		}
+	}
+}
+
 // allowedRendered are the keys Render may add on top of the allow-list.
 var allowedRendered = map[string]bool{
 	"pull_policy": true, "security_opt": true, "env_file": true, "labels": true, "ports": true, "networks": true,
@@ -457,6 +549,9 @@ func FuzzParseCompose(f *testing.F) {
 				}
 			}
 			if user, set := svc["user"]; set {
+				if _, ok := user.(string); !ok {
+					t.Fatalf("service %s accepted with a user that is not a string: %#v", name, user)
+				}
 				uid, _, _ := strings.Cut(fmt.Sprint(user), ":")
 				if n, err := strconv.Atoi(strings.TrimSpace(uid)); (err == nil && n == 0) || strings.TrimSpace(uid) == "root" {
 					t.Fatalf("service %s accepted with root user %q", name, user)

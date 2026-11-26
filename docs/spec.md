@@ -121,9 +121,14 @@ Unknown keys are an error. A definition that fails validation is reported by
 `zymple reload` and ignored; the previously loaded app keeps running on its
 last good definition and other apps are unaffected. Its tokens file is still
 re-read, so a token can be revoked while the definition is broken. An app is
-removed, and its containers stopped, only when its directory is gone. A
-definition that claims a domain a kept app still serves loses: it is not
-loaded, or the app stays on its own previous definition.
+removed, and its containers stopped, only when its directory no longer
+exists. If the path is still there but is not a plain directory (a symlink
+or a file), or cannot be inspected, the app keeps its previous definition
+and `zymple reload` reports it. When two definitions claim the same domain,
+the app already in use wins: one that is loaded, or, after a daemon restart,
+one that has a current release on record. The other is not loaded, or stays
+on its own previous definition. Between two apps that are both new, the one
+whose name sorts first wins. Reloads run one at a time.
 
 ### The compose subset
 
@@ -138,10 +143,12 @@ rejected.
   `pids_limit`, `volumes`.
 - Volumes are named volumes declared at the top level, with no options,
   mounted with the short `name:/path[:ro]` form. Host paths are not possible.
-- `user` is `USER[:GROUP]`. USER is a decimal uid from 1 to 4294967295,
-  written without sign or leading zeros, or a lowercase account name other
-  than `root`. GROUP is a decimal gid or a lowercase group name. No other
-  spelling is accepted. Omitting `user` runs the image's own user.
+- `user` is `USER[:GROUP]`. A numeric uid is plain decimal from 1 to
+  2147483647 and a numeric gid plain decimal from 0 to 2147483647; a name is
+  a lowercase account name, and the user may not be `root`. The check is
+  made on the text as written in the file, quoted or not, so `01000`,
+  `0x3E8`, `0o17`, `0b11`, `+1` and `1_000` are refused rather than read as
+  numbers. Omit the key to run the image's own user.
 - Service names are reserved when Zymple uses them itself:
   `<web service>-r<number>` always, `postgres` and `postgres-drill-*` when
   the app declares Postgres, and `redis` when it declares Redis.
@@ -192,7 +199,7 @@ Server side, per deploy:
 | verify | The digest exists in repository `zymple/<app>` | Reject |
 | | Take the app's deploy lock | HTTP 409 |
 | | Reserve a release number and a loopback port; start Postgres and Redis if they are not running | Abort |
-| release | Run `release` in a one-off container | Abort, old release untouched |
+| release | Run `release` in a one-off container | Abort, remove the one-off container, old release untouched |
 | start | Start the new web container | Abort, remove it |
 | health | Poll the health check until `health_timeout` | Abort, remove it |
 | switch | Atomically replace the app's port file, which Caddy reads on every request | Abort |
@@ -216,7 +223,10 @@ current one is started if stopped or recreated if missing, the proxy is
 pointed at it, and the other services are brought up. When the current
 release is already running, the proxy is pointed at it first, before
 anything is removed. One-off containers (`zymple run`, the release command)
-are never counted as the web container. A crash before the
+are never counted as the web container. Those of a release that is not
+current are removed, so a release command orphaned by a crash cannot keep
+running beside the live release; a `zymple run` on the current release is
+left alone. A crash before the
 commit therefore converges back to the old release, and one after it
 converges forward.
 
@@ -240,10 +250,13 @@ instant can be dropped, so domain changes are best made outside peak hours.
 
 - Each successful deploy is a numbered release: digest, port, time, who.
 - The last `keep_releases` images are tagged `zymple/<app>:release-<n>`.
-  Older release tags are removed after each deploy. A tag left by a push is
-  removed at once when its image is a kept release, and otherwise an hour
-  after cleanup first saw it, so that an image another CI job has pushed but
-  not yet deployed is not taken away under it.
+  Older release tags are removed after each deploy. Only a tag of the exact
+  form `release-<n>` is Zymple's own. Any other tag is removed at once when
+  its image is the release the deploy just made, and otherwise an hour after
+  cleanup first saw it, so that an image another CI job has pushed but not
+  yet deployed is not taken away under it. The first-seen times are kept in
+  the app's release state (`pending_tags`), so a daemon restart does not
+  restart the hour.
 - `zymple releases <app>` lists them.
 - `zymple rollback <app> [release]` runs the same sequence onto an image that
   is already on the host, skipping the `release` command. No transfer.
@@ -271,19 +284,25 @@ message. Do not run `prune -a` on a Zymple host; Zymple prunes its own images.
 - The server schedules backups: full weekly, differential daily. Retention is
   `pitr_days`.
 - A deploy never restarts the Postgres container. It is recreated only when
-  its image or settings change.
-- The app connects as role `app`, which owns database `app` and is not a
-  superuser: it cannot run programs or read files in the database container,
+  its image or settings change. The first deploy or reload after the Zymple
+  server starts repeats the role and backup-stanza setup on the running
+  container, without restarting it, so a setup that was interrupted is
+  finished.
+- The app connects as role `app`, which owns database `app` and its `public`
+  schema (on Postgres 14 Zymple hands the schema over explicitly; from 15 on
+  the database owner has it) and is not a superuser: it cannot run programs or read files in the database container,
   where the backup credentials are. The cluster's superuser is `postgres`,
   with its own generated password that no app is given. Only trusted
   extensions can be created from the app; for anything else use
   `docker exec -it zymple-<app>-postgres psql -U postgres app`.
 - Both passwords are generated on first use (`password` and `admin-password`
   in the app's `postgres/` state directory). The roles and the app's password
-  are re-applied at every start, so they survive a restore from another host.
+  are re-applied at every container start and once after each start of the
+  Zymple server, so they survive a restore from another host.
 - A cluster created before this split has `app` as its bootstrap superuser,
   which Postgres does not allow to be demoted. Zymple adds the `postgres`
-  role, keeps the cluster working and logs a warning at every start. To get
+  role, keeps the cluster working and logs a warning at every container start and
+  once after each start of the Zymple server. To get
   the split, dump the database and restore it into a new cluster.
 - A database container that has to be replaced is stopped first, with up to
   two minutes to shut down cleanly.
@@ -377,8 +396,9 @@ Known limits:
 - `docker inspect` on the host shows the Postgres superuser password. Anyone
   who can run docker there is already root-equivalent. Secrets are never put
   on a command line, where any local user could read them.
-- Long streams are bounded: past 10000 undelivered events the oldest are
-  dropped, and output with no line ending is cut into 64 KiB lines.
+- Long streams are bounded: past 10000 undelivered events, or 16 MiB of
+  undelivered output, the oldest are dropped, and output with no line ending
+  is cut into lines of at most 64 KiB, never inside a UTF-8 character.
 
 ## Decisions made while building
 
@@ -414,8 +434,15 @@ Known limits:
   image name is only done for digests from the app's own release history.
 - **Blob ownership is recorded by Zymple, not by the content store.** Each
   committed upload labels the blob with the repository it was pushed to
-  (`zymple.io/pushed-to.<repository>`), after containerd has verified the
-  bytes against the digest. Images pushed before this existed carry no
+  (`zymple.io/pushed-to.<repository>`). Zymple compares the uploaded bytes
+  with the claimed digest itself first: containerd's content service answers
+  "already exists" for a digest the host has without looking at the upload.
+- **An index may only name manifests the registry verified.** A manifest
+  stored through the manifest route is labelled
+  `zymple.io/manifest-of.<repository>`; an index is accepted only if every
+  entry carries it, and an image manifest may not name a manifest as a blob.
+  Otherwise a manifest uploaded as a plain blob, which nothing checks, could
+  be reached through an index. Images pushed before this existed carry no
   label, so the first push after an upgrade uploads every layer again.
   Releases already on the host are unaffected.
 - **Manifest lookups are bounded.** A lookup by digest answers only for the

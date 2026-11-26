@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gokaykucuk/zymple/internal/appdef"
 	"github.com/gokaykucuk/zymple/internal/auth"
 	"github.com/gokaykucuk/zymple/internal/config"
 	"github.com/gokaykucuk/zymple/internal/deploy"
@@ -186,6 +187,17 @@ func newFixture(t *testing.T, backup bool) *fixture {
 	}
 	sim := newSim()
 	fake := &execxtest.Fake{Handler: sim.handle}
+	s := newServer(cfg, fake)
+	writeApp(t, cfg.AppsDir, "shop", "")
+	if err := s.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return &fixture{Server: s, sim: sim, fake: fake, network: s.NetworkHandler(), admin: s.AdminHandler(), appsDir: cfg.AppsDir}
+}
+
+// newServer wires a server over cfg whose commands go to fake. A second one
+// over the same cfg is what a restarted daemon looks like.
+func newServer(cfg *config.Config, fake *execxtest.Fake) *Server {
 	s := &Server{
 		Config:   cfg,
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -201,11 +213,7 @@ func newFixture(t *testing.T, backup bool) *fixture {
 		Ports: &deploy.PortRange{Low: 41000, High: 41999}, Env: s.ServiceEnv,
 		Sleep: func(context.Context, time.Duration) {}, Now: time.Now,
 	}
-	writeApp(t, cfg.AppsDir, "shop", "")
-	if err := s.Reload(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	return &fixture{Server: s, sim: sim, fake: fake, network: s.NetworkHandler(), admin: s.AdminHandler(), appsDir: cfg.AppsDir}
+	return s
 }
 
 // call performs a request and returns the status, body and decoded events.
@@ -773,7 +781,7 @@ func TestReloadDoesNotLetANewAppTakeARunningAppsDomain(t *testing.T) {
 	writeAppWithDomain(t, f.appsDir, "aaa", "shop.example.com")
 	f.fake.Reset()
 	err := f.Reload(ctx)
-	if err == nil || !strings.Contains(err.Error(), "app aaa") || !strings.Contains(err.Error(), "not loaded") {
+	if err == nil || !strings.Contains(err.Error(), "app aaa") || !strings.Contains(err.Error(), "shop") {
 		t.Fatalf("the conflict was not reported: %v", err)
 	}
 	if _, ok := f.App("aaa"); ok {
@@ -806,6 +814,159 @@ func TestReloadDoesNotLetANewAppTakeARunningAppsDomain(t *testing.T) {
 	}
 	if shop, ok := f.App("shop"); !ok || shop.Domains[0] != "shop.example.com" {
 		t.Errorf("shop = %+v, %v", shop, ok)
+	}
+}
+
+// Regression: which app was serving a domain was only known in memory. After
+// a restart the definitions loaded in name order again, so a new app that
+// sorted earlier took the domain and the running app was left unloaded.
+func TestRestartDoesNotLetANewAppTakeARunningAppsDomain(t *testing.T) {
+	f := newFixture(t, false)
+	f.deploy(t, digestA)
+	writeAppWithDomain(t, f.appsDir, "aaa", "shop.example.com")
+
+	// The daemon restarts: nothing is loaded, the release record remains.
+	restarted := newServer(f.Config, f.fake)
+	f.fake.Reset()
+	err := restarted.Reload(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "app aaa") {
+		t.Fatalf("the conflict was not reported: %v", err)
+	}
+	if shop, ok := restarted.App("shop"); !ok || shop.Domains[0] != "shop.example.com" {
+		t.Fatalf("the app with a release on record was not loaded: %v", restarted.AppNames())
+	}
+	if _, ok := restarted.App("aaa"); ok {
+		t.Error("the newcomer was loaded with a domain that is in use")
+	}
+	if call := f.fake.Find("docker stop"); call != "" {
+		t.Errorf("the running app was stopped: %s", call)
+	}
+	if _, err := os.Stat(filepath.Join(f.Config.Caddy.SnippetsDir, "shop.caddy")); err != nil {
+		t.Errorf("the running app's snippet is gone: %v", err)
+	}
+	if _, ok := restarted.Tokens("aaa"); ok {
+		t.Error("the rejected newcomer has tokens loaded")
+	}
+
+	// Without a release on record there is no incumbent, and the name order
+	// decides as before.
+	if !restarted.incumbent(nil, "shop") || restarted.incumbent(nil, "aaa") {
+		t.Error("incumbent must follow the release record")
+	}
+	writeFile(t, filepath.Join(f.Store.Dir("aaa"), "releases.json"), "{corrupt")
+	if !restarted.incumbent(nil, "aaa") {
+		t.Error("state that cannot be read must count as in use")
+	}
+}
+
+// Regression: two overlapping reloads each read the loaded set, and the one
+// that finished last could put back a set older than the other's.
+func TestReloadsDoNotOverlap(t *testing.T) {
+	f := newFixture(t, false)
+	writeApp(t, f.appsDir, "second", "")
+	f.reloadMu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- f.Reload(context.Background()) }()
+	select {
+	case <-done:
+		f.reloadMu.Unlock()
+		t.Fatal("a reload ran while another held the reload lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, ok := f.App("second"); ok {
+		f.reloadMu.Unlock()
+		t.Fatal("a reload loaded definitions while another held the reload lock")
+	}
+	f.reloadMu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the waiting reload never ran")
+	}
+	if _, ok := f.App("second"); !ok {
+		t.Error("the waiting reload did not load the new app")
+	}
+	// The lock is free again afterwards.
+	if !f.reloadMu.TryLock() {
+		t.Fatal("reload left the reload lock held")
+	}
+	f.reloadMu.Unlock()
+}
+
+// Regression: whether an app was removed was decided by a Stat that followed
+// symlinks and read every error as "removed". A dangling symlink stopped a
+// running app, and a symlink to a directory kept the old definition silently.
+func TestReloadOnlyTreatsAMissingDirectoryAsRemoved(t *testing.T) {
+	ctx := context.Background()
+	for name, replace := range map[string]func(t *testing.T, dir string){
+		"dangling symlink": func(t *testing.T, dir string) {
+			if err := os.Symlink(filepath.Join(filepath.Dir(dir), "nowhere"), dir); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"symlink to a directory": func(t *testing.T, dir string) {
+			moved := filepath.Join(t.TempDir(), "shop")
+			writeApp(t, filepath.Dir(moved), "shop", "keep_releases: 7\n")
+			if err := os.Symlink(moved, dir); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"file": func(t *testing.T, dir string) { writeFile(t, dir, "not a directory") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, false)
+			f.deploy(t, digestA)
+			dir := filepath.Join(f.appsDir, "shop")
+			if err := os.RemoveAll(dir); err != nil {
+				t.Fatal(err)
+			}
+			replace(t, dir)
+			f.fake.Reset()
+			err := f.Reload(ctx)
+			if err == nil || !strings.Contains(err.Error(), "app shop") ||
+				!strings.Contains(err.Error(), "not a plain directory") ||
+				!strings.Contains(err.Error(), "keeping the previous definition") {
+				t.Fatalf("the unusable app directory was not reported: %v", err)
+			}
+			app, ok := f.App("shop")
+			if !ok || app.KeepReleases == 7 {
+				t.Fatalf("the previous definition was not kept: %+v, %v", app, ok)
+			}
+			if call := f.fake.Find("docker stop"); call != "" {
+				t.Errorf("the running app was stopped: %s", call)
+			}
+			if _, err := os.Stat(filepath.Join(f.Config.Caddy.SnippetsDir, "shop.caddy")); err != nil {
+				t.Errorf("the running app's snippet is gone: %v", err)
+			}
+		})
+	}
+}
+
+func TestDefinitionGone(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "file")
+	writeFile(t, file, "x")
+	if gone, err := definitionGone(filepath.Join(root, "missing")); !gone || err != nil {
+		t.Errorf("missing path: %v, %v", gone, err)
+	}
+	if gone, err := definitionGone(root); gone || err != nil {
+		t.Errorf("directory: %v, %v", gone, err)
+	}
+	if gone, err := definitionGone(file); gone || err == nil {
+		t.Errorf("file: %v, %v", gone, err)
+	}
+	// A path that cannot be inspected is not a removal either.
+	gone, err := definitionGone(filepath.Join(file, "shop"))
+	if gone || err == nil || !strings.Contains(err.Error(), "cannot inspect") {
+		t.Errorf("path below a file: %v, %v", gone, err)
+	}
+	previous := map[string]*appdef.App{"shop": {Name: "shop"}}
+	apps, errs := keepPrevious(previous, map[string]*appdef.App{}, file)
+	if apps["shop"] != previous["shop"] || len(errs) != 1 || !strings.Contains(errs[0].Error(), "keeping the previous definition") {
+		t.Errorf("an app whose directory cannot be inspected: %v, %v", apps, errs)
 	}
 }
 
@@ -1003,6 +1164,100 @@ func TestLineWriterBoundsALineWithNoEnd(t *testing.T) {
 	events, _, _ = st.from(0)
 	if len(events) != 2 || len(events[0].Message) != maxLine || events[1].Message != "yyyyy" {
 		t.Errorf("long line became %d events", len(events))
+	}
+}
+
+// Regression: a line cut at the size limit was cut in the middle of a
+// multi-byte character, and both halves reached the client as garbage.
+func TestLineWriterCutsBetweenCharacters(t *testing.T) {
+	for _, char := range []string{"é", "€", "😀"} {
+		for lead := 1; lead < len(char); lead++ {
+			// lead bytes of the character fit under the limit; the rest do not.
+			input := strings.Repeat("x", maxLine-lead) + char + "tail"
+			for name, write := range map[string]func(w *lineWriter){
+				"one write": func(w *lineWriter) { fmt.Fprint(w, input+"\n") },
+				// The buffer reaches the limit before the rest of the
+				// character has arrived.
+				"split at the limit": func(w *lineWriter) {
+					fmt.Fprint(w, input[:maxLine])
+					fmt.Fprint(w, input[maxLine:]+"\n")
+				},
+				"no line end": func(w *lineWriter) { fmt.Fprint(w, input); w.flush() },
+			} {
+				st := newStream()
+				write(st.writer("out"))
+				events, _, _ := st.from(0)
+				if len(events) != 2 || len(events[0].Message) != maxLine-lead || events[1].Message != char+"tail" {
+					t.Fatalf("%q, %d bytes under the limit, %s: %d events, first %d bytes, last %q",
+						char, lead, name, len(events), len(events[0].Message), events[len(events)-1].Message)
+				}
+			}
+		}
+	}
+	// A character that ends exactly at the limit stays whole, and bytes that
+	// are not UTF-8 are still cut at the limit.
+	for name, input := range map[string]string{
+		"ends at the limit": strings.Repeat("x", maxLine-4) + "😀" + "tail",
+		"not UTF-8":         strings.Repeat("\x80", maxLine) + "tail",
+		"stray lead byte":   strings.Repeat("x", maxLine-5) + "\xf0xxxx" + "tail",
+	} {
+		st := newStream()
+		fmt.Fprint(st.writer("out"), input+"\n")
+		events, _, _ := st.from(0)
+		if len(events) != 2 || events[0].Message != input[:maxLine] || events[1].Message != "tail" {
+			t.Errorf("%s: %d events, first %d bytes", name, len(events), len(events[0].Message))
+		}
+	}
+}
+
+// Regression: the backlog was bounded by the number of events only, and ten
+// thousand events of the largest size are hundreds of megabytes.
+func TestStreamBoundsItsBacklogByBytes(t *testing.T) {
+	st := newStream()
+	line := strings.Repeat("x", maxLine)
+	const fits = maxBacklogBytes / maxLine
+	total := fits + 44
+	for i := 0; i < total; i++ {
+		st.add(deploy.Event{Step: fmt.Sprint(i), Status: "log", Message: line})
+	}
+	st.mu.Lock()
+	held, size := len(st.events), st.bytes
+	st.mu.Unlock()
+	if held != fits || size != maxBacklogBytes {
+		t.Fatalf("stream holds %d events of %d bytes, limit %d bytes", held, size, maxBacklogBytes)
+	}
+	// A late reader gets the newest events and the right index to go on from.
+	events, next, _, _ := st.read(0)
+	if len(events) != fits || events[0].Step != "44" || events[fits-1].Step != fmt.Sprint(total-1) || next != total {
+		t.Fatalf("read %d events from %s, next %d", len(events), events[0].Step, next)
+	}
+	// Releasing delivered events gives their bytes back.
+	st.release(next - 1)
+	st.mu.Lock()
+	held, size = len(st.events), st.bytes
+	st.mu.Unlock()
+	if held != 1 || size != maxLine {
+		t.Fatalf("after a release the stream holds %d events of %d bytes", held, size)
+	}
+	// The newest event is kept even when it alone is over the limit, and it
+	// pushes out everything before it.
+	st.add(deploy.Event{Step: "done", Status: "ok", Message: strings.Repeat("y", maxBacklogBytes+1)})
+	events, next, _, _ = st.read(0)
+	if len(events) != 1 || events[0].Step != "done" || next != total+1 {
+		t.Fatalf("an oversized outcome: %d events, next %d", len(events), next)
+	}
+	st.release(next)
+	st.release(next + 5) // past the end must not panic
+	st.mu.Lock()
+	held, size = len(st.events), st.bytes
+	st.mu.Unlock()
+	if held != 0 || size != 0 {
+		t.Errorf("an emptied stream holds %d events of %d bytes", held, size)
+	}
+	// Small events are still bounded by count.
+	st.add(deploy.Event{Step: "after"})
+	if events, _, _, _ := st.read(next); len(events) != 1 || events[0].Step != "after" {
+		t.Errorf("events after a release: %+v", events)
 	}
 }
 

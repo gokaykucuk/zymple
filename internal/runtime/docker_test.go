@@ -338,3 +338,77 @@ func TestComposeCommandsReportFailuresAndQuietOrphanWarnings(t *testing.T) {
 		t.Error("compose runs without COMPOSE_IGNORE_ORPHANS")
 	}
 }
+
+// Regression: Containers leaves one-off containers out, so nothing removed
+// a release command that a crash of the daemon had left running.
+func TestRemoveOneOffs(t *testing.T) {
+	fake := &execxtest.Fake{Handler: psHandler(
+		"mig running 5 web-r5",
+		"con running 4 web-r4",
+		"old exited 3 web-r3",
+		"nolabel running",
+	)}
+	d := &Docker{Runner: fake}
+	ctx := context.Background()
+	if err := d.RemoveOneOffs(ctx, "shop", func(release int) bool { return release != 4 }); err != nil {
+		t.Fatal(err)
+	}
+	ps := fake.Find("docker ps")
+	if !strings.Contains(ps, "label=zymple.app=shop") || !strings.Contains(ps, "label=com.docker.compose.oneoff=True") {
+		t.Errorf("one-offs of the app are not selected: %s", ps)
+	}
+	if strings.Contains(ps, "oneoff=False") || !strings.Contains(ps, " -a ") {
+		t.Errorf("wrong listing: %s", ps)
+	}
+	if fake.Find("docker rm -f mig old") == "" || fake.Count("con") != 0 {
+		t.Errorf("removed the wrong containers: %v", fake.Calls())
+	}
+	fake.Reset()
+	if err := d.RemoveOneOffs(ctx, "shop", func(int) bool { return false }); err != nil || len(fake.Calls()) != 1 {
+		t.Errorf("nothing selected should remove nothing: %v, %v", err, fake.Calls())
+	}
+	fake.Handler = func(c execx.Cmd) (string, error) {
+		if c.Args[0] == "ps" {
+			return "mig running 5 web-r5\n", nil
+		}
+		return "", errors.New("rm failed")
+	}
+	if err := d.RemoveOneOffs(ctx, "shop", func(int) bool { return true }); err == nil {
+		t.Error("a failing removal must be reported")
+	}
+	fake.Handler = func(execx.Cmd) (string, error) { return "", errors.New("daemon down") }
+	if err := d.RemoveOneOffs(ctx, "shop", func(int) bool { return true }); err == nil {
+		t.Error("a failing listing must be reported")
+	}
+}
+
+// Regression: any tag starting with "release-" counted as Zymple's own.
+func TestParseReleaseTag(t *testing.T) {
+	for _, n := range []int{1, 7, 10, 123456} {
+		if got, ok := ParseReleaseTag(ReleaseTag(n)); !ok || got != n {
+			t.Errorf("ParseReleaseTag(%q) = %d, %v", ReleaseTag(n), got, ok)
+		}
+	}
+	for _, tag := range []string{
+		"", "release", "release-", "release-0", "release--1", "release-+1", "release-01", "release-1.4.0",
+		"release-1 ", "release-1a", "release-0x10", "release-1_000", "Release-1", "push-1", "1",
+		"release-99999999999999999999999999",
+	} {
+		if n, ok := ParseReleaseTag(tag); ok {
+			t.Errorf("ParseReleaseTag(%q) = %d, want it refused", tag, n)
+		}
+	}
+}
+
+// FuzzParseReleaseTag: tags come from whoever pushes to the registry.
+func FuzzParseReleaseTag(f *testing.F) {
+	for _, seed := range []string{"release-1", "release-1.4.0", "release-", "release-007", "latest"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, tag string) {
+		n, ok := ParseReleaseTag(tag)
+		if ok && (n < 1 || ReleaseTag(n) != tag) {
+			t.Fatalf("ParseReleaseTag(%q) = %d, which is not what ReleaseTag writes", tag, n)
+		}
+	})
+}

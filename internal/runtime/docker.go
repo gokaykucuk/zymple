@@ -143,12 +143,18 @@ func labelFilter(key, value string) []string {
 }
 
 func (d *Docker) list(ctx context.Context, app, role string, oneOffs bool) ([]Container, error) {
+	filters := labelFilter(appdef.LabelRole, role)
+	if !oneOffs {
+		filters = append(filters, labelFilter(composeOneOffLabel, "False")...)
+	}
+	return d.ps(ctx, app, filters)
+}
+
+// ps lists the app's containers, running or not, that pass the filters.
+func (d *Docker) ps(ctx context.Context, app string, filters []string) ([]Container, error) {
 	format := fmt.Sprintf(`{{.ID}} {{.State}} {{.Label %q}} {{.Label %q}}`, appdef.LabelRelease, composeServiceLabel)
 	args := append([]string{"ps", "-a"}, labelFilter(appdef.LabelApp, app)...)
-	args = append(args, labelFilter(appdef.LabelRole, role)...)
-	if !oneOffs {
-		args = append(args, labelFilter(composeOneOffLabel, "False")...)
-	}
+	args = append(args, filters...)
 	out, err := execx.Output(ctx, d.Runner, "docker", append(args, flagFormat, format)...)
 	if err != nil {
 		return nil, err
@@ -204,6 +210,28 @@ func (d *Docker) RemoveWeb(ctx context.Context, app string, release int) error {
 	ids, err := d.webIDs(ctx, app, release)
 	if err != nil || len(ids) == 0 {
 		return err
+	}
+	_, err = execx.Output(ctx, d.Runner, "docker", append([]string{"rm", "-f"}, ids...)...)
+	return err
+}
+
+// RemoveOneOffs force-removes the app's one-off containers of the releases
+// match selects. One-offs are what `compose run` starts: the release command
+// and `zymple run`. Containers() leaves them out, so nothing else removes
+// one that a crash of the daemon left running.
+func (d *Docker) RemoveOneOffs(ctx context.Context, app string, match func(release int) bool) error {
+	list, err := d.ps(ctx, app, labelFilter(composeOneOffLabel, "True"))
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for _, c := range list {
+		if match(c.Release) {
+			ids = append(ids, c.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
 	}
 	_, err = execx.Output(ctx, d.Runner, "docker", append([]string{"rm", "-f"}, ids...)...)
 	return err
@@ -283,6 +311,21 @@ const ReleaseTagPrefix = "release-"
 
 // ReleaseTag is the local tag that pins a release's image against pruning.
 func ReleaseTag(release int) string { return ReleaseTagPrefix + strconv.Itoa(release) }
+
+// ParseReleaseTag returns the release a tag pins. Only the exact text
+// ReleaseTag produces counts: "release-1.4.0" and "release-07" are tags
+// somebody else chose.
+func ParseReleaseTag(tag string) (int, bool) {
+	rest, ok := strings.CutPrefix(tag, ReleaseTagPrefix)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil || n < 1 || ReleaseTag(n) != tag {
+		return 0, false
+	}
+	return n, true
+}
 
 // Pin tags a release's image so image pruning cannot remove it.
 func (d *Docker) Pin(ctx context.Context, app, digest string, release int) error {

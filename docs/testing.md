@@ -98,13 +98,17 @@ match its digest, a manifest that is malformed or references blobs that were
 never uploaded, reads, deletes, other repositories and cross-repository
 mounts. One app replaying another app's manifest, or putting its own config
 on another app's layers, is refused until it has uploaded every blob itself,
-and a lookup of a layer as a manifest is answered without reading it.
+and a lookup of a layer as a manifest is answered without reading it. An
+empty or junk upload under another app's digest is refused against a store
+that, like the containerd daemon, reports "already exists" without checking
+the bytes. An index naming a manifest that was only uploaded as a blob is
+refused.
 Fuzzing asserts that a repository which owns no blobs can never store a
 manifest.
 
 ### Compose validation
 
-A corpus of 90 escape attempts that must all be rejected: privileged mode,
+A corpus of escape attempts that must all be rejected: privileged mode,
 host namespaces, capabilities, devices, the Docker socket, host bind mounts
 in every syntax, volume driver options, `build:`, published ports, other
 images, interpolation, root users in every spelling Docker resolves to uid 0,
