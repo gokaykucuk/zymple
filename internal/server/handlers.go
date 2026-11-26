@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -58,6 +59,7 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("GET /admin/apps/{app}/pg/info", s.withApp(s.handlePGInfo))
 	mux.HandleFunc("POST /admin/apps/{app}/pg/backup", s.withApp(s.handlePGBackup))
 	mux.HandleFunc("POST /admin/apps/{app}/pg/restore", s.withApp(s.handlePGRestore))
+	mux.HandleFunc("POST /admin/apps/{app}/pg/import", s.withApp(s.handlePGImport))
 	mux.HandleFunc("DELETE /admin/apps/{app}/pg/drills/{drill}", s.withApp(s.handlePGDrillRemove))
 	mux.HandleFunc("POST /admin/apps/{app}/redis/backup", s.withApp(s.handleRedisBackup))
 	mux.HandleFunc("POST /admin/apps/{app}/redis/restore", s.withApp(s.handleRedisRestore))
@@ -467,6 +469,57 @@ func (s *Server) restoreInPlace(ctx context.Context, app *appdef.App, opts servi
 		return errors.Join(restoreErr, err)
 	}
 	return restoreErr
+}
+
+func (s *Server) handlePGImport(w http.ResponseWriter, r *http.Request, app *appdef.App) {
+	var body struct {
+		File    string `json:"file"`
+		Jobs    int    `json:"jobs"`
+		NoStart bool   `json:"no_start"`
+	}
+	if !readJSON(w, r, &body) || !s.requirePostgres(w, app) {
+		return
+	}
+	opts := services.ImportOptions{File: body.File, Jobs: body.Jobs}
+	if err := opts.Validate(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	s.detached(w, r, func(ctx context.Context, st *stream) error {
+		out := st.writer("import")
+		defer out.flush()
+		return s.importDatabase(ctx, app, opts, body.NoStart, st, out)
+	})
+}
+
+// importDatabase stops the app, replaces its database with a dump and starts
+// the app again. It holds the deploy lock throughout. If the import fails
+// after the database was dropped, the app stays stopped: its database is then
+// empty or half loaded, and serving from it would be worse than not serving.
+func (s *Server) importDatabase(ctx context.Context, app *appdef.App, opts services.ImportOptions, noStart bool, st *stream, out io.Writer) error {
+	unlock, err := s.Engine.Lock(app.Name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	note := func(msg string) { st.add(deploy.Event{Step: "import", Status: "log", Message: msg}) }
+	note("stopping the app's containers")
+	if err := s.Docker.StopAll(ctx, app.Name); err != nil {
+		return err
+	}
+	if err := s.Postgres.Import(ctx, app, opts, out); err != nil {
+		if errors.Is(err, services.ErrDatabaseUntouched) {
+			note("starting the app's containers again; nothing was changed")
+			return errors.Join(err, s.Docker.StartAll(ctx, app.Name))
+		}
+		return fmt.Errorf("%w; the app's containers are left stopped because its database is incomplete", err)
+	}
+	if noStart {
+		note("the app's containers are left stopped; start them with `zymple reload`")
+		return nil
+	}
+	note("starting the app's containers")
+	return s.Docker.StartAll(ctx, app.Name)
 }
 
 func (s *Server) handlePGDrillRemove(w http.ResponseWriter, r *http.Request, app *appdef.App) {

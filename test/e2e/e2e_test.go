@@ -405,6 +405,101 @@ func TestPostgresPointInTimeRecovery(t *testing.T) {
 	}
 }
 
+// TestImportDumpFromAnotherCluster imports a dump shaped like one from a
+// platform that ran the database as a superuser: objects owned by roles that
+// do not exist on the target, by the superuser itself, and by a role the
+// target does have.
+func TestImportDumpFromAnotherCluster(t *testing.T) {
+	src := newApp(t, "exporter", appOptions{postgres: true})
+	src.deploy(t, "v1")
+	dst := newApp(t, "importer", appOptions{postgres: true})
+	dst.deploy(t, "v1")
+	srcPG, dstPG := "zymple-"+src.name+"-postgres", "zymple-"+dst.name+"-postgres"
+	as := func(container, role, database, query string) string {
+		t.Helper()
+		return mustHost(t, "docker", "exec", container, "psql", "-U", role, "-d", database, "-v", "ON_ERROR_STOP=1", "-qAt", "-c", query)
+	}
+
+	as(srcPG, "postgres", "app", `
+		create role legacy_owner nologin; create role legacy_reader nologin; create role keeper nologin;
+		create table by_legacy(id int primary key, note text); alter table by_legacy owner to legacy_owner;
+		insert into by_legacy select g, 'row ' || g from generate_series(1, 500) g;
+		create table by_super(id int primary key); insert into by_super values (1), (2);
+		create table by_keeper(id int primary key); alter table by_keeper owner to keeper; insert into by_keeper values (7);
+		grant select on by_legacy to legacy_reader;
+		create type mood as enum ('fine'); create function answer() returns int language sql as 'select 42';
+		create schema extra; create table extra.t(id int);`)
+	const dump = "/var/lib/zymple/export.pgdump"
+	mustHost(t, "sh", "-c", "docker exec "+srcPG+" pg_dump -U postgres -Fc -d app > "+dump+" && chmod 600 "+dump)
+
+	// The target already has one of the roles, and data of its own.
+	as(dstPG, "postgres", "postgres", "create role keeper nologin")
+	as(dstPG, "app", "app", "create table old_data(id int)")
+	if err := hostWrite("/etc/zymple/apps/"+dst.name+"/after-import.sql",
+		"create table import_marker as select current_user::text as ran_as; grant select on import_marker to app;\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	if out, err := hostOutput("zymple", "pg", "import", dst.name, dump); err == nil {
+		t.Fatalf("import ran without --yes:\n%s", out)
+	}
+	if got := as(dstPG, "app", "app", "select count(*) from old_data"); got != "0" {
+		t.Fatalf("the database changed although the import was refused: %q", got)
+	}
+	// A file that is not an archive is refused, and the app keeps serving.
+	mustHost(t, "sh", "-c", "echo not-a-dump > /var/lib/zymple/garbage.pgdump")
+	if out, err := hostOutput("zymple", "pg", "import", dst.name, "/var/lib/zymple/garbage.pgdump", "--yes"); err == nil || !strings.Contains(out, "not changed") {
+		t.Fatalf("garbage import: %v\n%s", err, out)
+	}
+	dst.wantVersion(t, "v1")
+	as(dstPG, "app", "app", "select count(*) from old_data")
+
+	out := mustHost(t, "zymple", "pg", "import", dst.name, dump, "--yes", "--jobs", "2")
+	t.Logf("import output:\n%s", out)
+
+	if got := as(dstPG, "app", "app", "select count(*) || ' ' || max(note) from by_legacy"); got != "500 row 99" {
+		t.Errorf("imported rows = %q", got)
+	}
+	owners := as(dstPG, "postgres", "app", `select string_agg(relname || '=' || pg_get_userbyid(relowner), ' ' order by relname)
+		from pg_class where relname in ('by_legacy', 'by_super', 'by_keeper', 't', 'import_marker')`)
+	if owners != "by_keeper=keeper by_legacy=app by_super=app import_marker=postgres t=app" {
+		t.Errorf("owners after import = %q", owners)
+	}
+	others := as(dstPG, "postgres", "app", `select
+		(select pg_get_userbyid(typowner) from pg_type where typname = 'mood') || ' ' ||
+		(select pg_get_userbyid(proowner) from pg_proc where proname = 'answer') || ' ' ||
+		(select pg_get_userbyid(nspowner) from pg_namespace where nspname = 'extra')`)
+	if others != "app app app" {
+		t.Errorf("type, function and schema owners = %q", others)
+	}
+	if roles := as(dstPG, "postgres", "postgres", "select count(*) from pg_roles where rolname in ('legacy_owner', 'legacy_reader')"); roles != "0" {
+		t.Errorf("%s borrowed roles were left in the cluster", roles)
+	}
+	if gone := as(dstPG, "postgres", "app", "select to_regclass('old_data') is null"); gone != "t" {
+		t.Error("the target's old data survived the import")
+	}
+	if ran := as(dstPG, "app", "app", "select ran_as from import_marker"); ran != "postgres" {
+		t.Errorf("after-import.sql ran as %q", ran)
+	}
+	// The app's own role can work with what it was handed, and is still not
+	// a superuser.
+	as(dstPG, "app", "app", "insert into by_legacy values (501, 'written by the app'); alter table by_super add column note text; select answer()")
+	if super := as(dstPG, "postgres", "postgres", "select rolsuper from pg_roles where rolname = 'app'"); super != "f" {
+		t.Errorf("the app's role is a superuser after the import: %q", super)
+	}
+	if left := mustHost(t, "sh", "-c", "ls /var/lib/zymple/apps/"+dst.name+"/postgres/data/"); strings.Contains(left, "zymple-import") {
+		t.Errorf("the staged archive was left in the data directory: %s", left)
+	}
+	dst.wantVersion(t, "v1")
+	if status := dst.mustCLI(t, "status", dst.name); !strings.Contains(status, "web:       running") {
+		t.Errorf("status after import:\n%s", status)
+	}
+	// The source is untouched.
+	if got := as(srcPG, "postgres", "app", "select count(*) from by_legacy"); got != "500" {
+		t.Errorf("the source lost data: %q", got)
+	}
+}
+
 // TestZAggressivePruneIsSurvivable runs last: `docker image prune -a` damages
 // every app on the host. It removes the kept releases, and it strips the
 // image name even from repositories whose containers are running. Zymple
