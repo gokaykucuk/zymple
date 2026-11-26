@@ -119,6 +119,12 @@ postgres: { version: 17, pitr_days: 14 }
 redis: { persistent: false }
 ```
 
+`postgres` and `redis` each take an optional `env`: the name of the variable
+their connection URL is injected as. The defaults are `DATABASE_URL` and
+`REDIS_URL`. An app that reads its own names sets them here, for example
+`postgres: { version: 17, env: SHOP_DATABASE_URL }`, since the compose file
+cannot rename variables.
+
 Unknown keys are an error. A definition that fails validation is reported by
 `zymple reload` and ignored; the previously loaded app keeps running on its
 last good definition and other apps are unaffected. Its tokens file is still
@@ -157,7 +163,8 @@ rejected.
 - Mapping keys must be strings.
 - `$` is not allowed anywhere else, which disables compose interpolation.
 - YAML anchors, aliases and merge keys are refused.
-- `DATABASE_URL` and `REDIS_URL` may not be set by the app.
+- `DATABASE_URL`, `REDIS_URL` and any names chosen with `env` may not be set
+  by the app.
 
 For each release Zymple renders the file it actually runs: the image pinned
 by digest, `pull_policy: never`, `no-new-privileges`, the env file, labels,

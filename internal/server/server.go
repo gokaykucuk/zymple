@@ -108,14 +108,14 @@ func (s *Server) ServiceEnv(ctx context.Context, app *appdef.App) (map[string]st
 		if err != nil {
 			return nil, fmt.Errorf("postgres: %w", err)
 		}
-		env["DATABASE_URL"] = url
+		env[app.Postgres.Env] = url
 	}
 	if app.Redis != nil {
 		url, err := s.Redis.Ensure(ctx, app)
 		if err != nil {
 			return nil, fmt.Errorf("redis: %w", err)
 		}
-		env["REDIS_URL"] = url
+		env[app.Redis.Env] = url
 	}
 	return env, nil
 }

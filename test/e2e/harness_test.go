@@ -262,7 +262,7 @@ func newApp(t *testing.T, name string, o appOptions) app {
 		yml += fmt.Sprintf("keep_releases: %d\n", o.keep)
 	}
 	if o.postgres {
-		yml += "postgres: { version: 17, pitr_days: 7 }\n"
+		yml += "postgres: { version: 17, pitr_days: 7, env: LEDGER_DATABASE_URL }\n"
 	}
 	if o.redis {
 		yml += "redis: { persistent: false }\n"
