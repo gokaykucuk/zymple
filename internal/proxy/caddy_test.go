@@ -31,7 +31,7 @@ func read(t *testing.T, path string) string {
 func TestSnippet(t *testing.T) {
 	c := &Caddy{Dir: "/etc/caddy/zymple", TLS: TLSAuto}
 	got := c.Snippet("shop", []string{"a.example.com", "b.example.com"})
-	want := "a.example.com, b.example.com {\n\treverse_proxy 127.0.0.1:{file./etc/caddy/zymple/shop.port}\n}"
+	want := "a.example.com, b.example.com {\n\tvars zymple_port {file./etc/caddy/zymple/shop.port}\n\treverse_proxy 127.0.0.1:{vars.zymple_port}\n}"
 	if !strings.Contains(got, want) {
 		t.Errorf("auto snippet:\n%s", got)
 	}

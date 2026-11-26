@@ -63,8 +63,10 @@ func (c *Caddy) Snippet(app string, domains []string) string {
 		b.WriteString("\ttls internal\n")
 	}
 	// {file.*} is evaluated for every request, which is what makes a switch
-	// take effect without a reload.
-	fmt.Fprintf(&b, "\treverse_proxy 127.0.0.1:{file.%s}\n}\n", c.PortPath(app))
+	// take effect without a reload. It goes through a variable because Caddy
+	// cannot parse an upstream address that has a file path inside it.
+	fmt.Fprintf(&b, "\tvars zymple_port {file.%s}\n", c.PortPath(app))
+	b.WriteString("\treverse_proxy 127.0.0.1:{vars.zymple_port}\n}\n")
 	return b.String()
 }
 
