@@ -493,3 +493,82 @@ func TestPGImportSendsAnAbsolutePath(t *testing.T) {
 		t.Errorf("the daemon was not sent an absolute path: %s", body)
 	}
 }
+
+func TestDeployWithExtraImages(t *testing.T) {
+	h := newHarness(t)
+	other := "sha256:" + strings.Repeat("b", 64)
+	code, out, stderr := h.run(true, "deploy", "shop", "--digest", digest, "--digest", "ocr="+other)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	if _, body := h.api.last(); body != `{"digest":"`+digest+`","images":{"ocr":"`+other+`"}}` {
+		t.Errorf("body = %s", body)
+	}
+	if !strings.Contains(out, "==> deploy "+digest) || !strings.Contains(out, "==> deploy ocr "+other) {
+		t.Errorf("output:\n%s", out)
+	}
+
+	// An extra image alone: the app's own image is left to the server.
+	if code, _, stderr := h.run(true, "deploy", "shop", "--digest", "ocr="+other); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	if _, body := h.api.last(); body != `{"images":{"ocr":"`+other+`"}}` {
+		t.Errorf("body = %s", body)
+	}
+
+	// Each pushed image becomes the digest of its own name.
+	pushed := map[string]string{"shop:build-7": digest, "shop-ocr:build-7": other}
+	var source string
+	h.fake.Handler = func(c execx.Cmd) (string, error) {
+		if len(c.Args) > 1 && c.Args[0] == "tag" {
+			source = c.Args[1]
+		}
+		if len(c.Args) > 2 && c.Args[2] == "push" {
+			return "push-x: digest: " + pushed[source] + " size: 1\n", nil
+		}
+		return "unix:///var/run/docker.sock\n", nil
+	}
+	code, out, stderr = h.run(true, "deploy", "shop", "--image", "ocr=shop-ocr:build-7", "--image", "shop:build-7")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	if _, body := h.api.last(); body != `{"digest":"`+digest+`","images":{"ocr":"`+other+`"}}` {
+		t.Errorf("body = %s", body)
+	}
+	if !strings.Contains(out, "==> push shop:build-7") || !strings.Contains(out, "==> push shop-ocr:build-7") {
+		t.Errorf("output:\n%s", out)
+	}
+
+	// A pushed image and a digest for different names mix.
+	if code, _, stderr := h.run(true, "deploy", "shop", "--image", "shop:build-7", "--digest", "ocr="+other); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	if _, body := h.api.last(); body != `{"digest":"`+digest+`","images":{"ocr":"`+other+`"}}` {
+		t.Errorf("body = %s", body)
+	}
+}
+
+func TestDeployRejectsBadImageFlags(t *testing.T) {
+	h := newHarness(t)
+	other := "sha256:" + strings.Repeat("b", 64)
+	for _, args := range [][]string{
+		{"deploy", "shop", "--digest", "ocr=latest"},
+		{"deploy", "shop", "--digest", "OCR=" + other},
+		{"deploy", "shop", "--digest", "my-ocr=" + other},
+		{"deploy", "shop", "--digest", "=" + other},
+		{"deploy", "shop", "--digest", "ocr="},
+		{"deploy", "shop", "--digest", ""},
+		{"deploy", "shop", "--image", ""},
+		{"deploy", "shop", "--digest", "ocr=" + other, "--digest", "ocr=" + other},
+		{"deploy", "shop", "--digest", digest, "--digest", digest},
+		{"deploy", "shop", "--image", "ocr=a", "--digest", "ocr=" + other},
+		{"deploy", "shop", "--image", "a", "--image", "b"},
+	} {
+		if code, _, stderr := h.run(true, args...); code != 2 {
+			t.Errorf("%v: exit %d (%s), want a usage error", args, code, stderr)
+		}
+	}
+	if req, _ := h.api.last(); req != "" {
+		t.Errorf("a refused command reached the server: %s", req)
+	}
+}

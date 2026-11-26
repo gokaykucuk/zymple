@@ -229,6 +229,8 @@ type appOptions struct {
 	postgres      bool
 	redis         bool
 	compose       string
+	// images is the app's list of extra images, as written in app.yml.
+	images string
 }
 
 const defaultCompose = `services:
@@ -266,6 +268,9 @@ func newApp(t *testing.T, name string, o appOptions) app {
 	}
 	if o.redis {
 		yml += "redis: { persistent: false }\n"
+	}
+	if o.images != "" {
+		yml += "images: " + o.images + "\n"
 	}
 	out, err := exec.Command(cliPath, "token", "generate", "ci").Output()
 	if err != nil {

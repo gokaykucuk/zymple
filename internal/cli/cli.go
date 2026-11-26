@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -36,6 +37,8 @@ const usage = `usage: zymple <command> [arguments]
 From CI or a laptop (ZYMPLE_HOST and ZYMPLE_TOKEN set):
   deploy <app> --image <ref>     push a local image and release it
   deploy <app> --digest <sha>    release an image that is already on the host
+                                 an extra image is <name>=<ref> or <name>=<sha>;
+                                 both flags repeat, and what is left out stays
   rollback <app> [release]       re-activate an older release
   releases <app>                 list kept releases
   status <app>                   show the current release
@@ -265,10 +268,47 @@ func cmdToken(args []string, env Env) error {
 	return err
 }
 
+// imageFlags collects a repeatable --image or --digest flag. A value is
+// either the app's own image or <name>=<value> for one of its extra images.
+type imageFlags map[string]string
+
+func (f imageFlags) String() string { return "" }
+
+func (f imageFlags) Set(value string) error {
+	name, rest, named := strings.Cut(value, "=")
+	if !named {
+		name, rest = "", value
+	} else if !appdef.ValidImageName(name) {
+		return fmt.Errorf("%q is not an image name", name)
+	}
+	if rest == "" {
+		return errors.New("the value is empty")
+	}
+	if _, dup := f[name]; dup {
+		return fmt.Errorf("given twice for %s", imageLabel(name))
+	}
+	f[name] = rest
+	return nil
+}
+
+func imageLabel(name string) string {
+	if name == "" {
+		return "the app's image"
+	}
+	return "image " + name
+}
+
+// deployBody is the request of POST /api/v1/apps/<app>/deploys.
+type deployBody struct {
+	Digest string            `json:"digest,omitempty"`
+	Images map[string]string `json:"images,omitempty"`
+}
+
 func cmdDeploy(ctx context.Context, args []string, env Env) error {
 	fs := newFlags("deploy", env)
-	image := fs.String("image", "", "")
-	digest := fs.String("digest", "", "")
+	images, digests := imageFlags{}, imageFlags{}
+	fs.Var(images, "image", "")
+	fs.Var(digests, "digest", "")
 	rest, err := parse(fs, args)
 	if err != nil {
 		return err
@@ -277,28 +317,60 @@ func cmdDeploy(ctx context.Context, args []string, env Env) error {
 	if err != nil {
 		return err
 	}
-	if (*image == "") == (*digest == "") {
-		return usagef("give exactly one of --image and --digest")
+	if err := checkImageFlags(images, digests); err != nil {
+		return err
 	}
 	c, err := connect(env)
 	if err != nil {
 		return err
 	}
-	if *image != "" {
-		if c.Token == "" {
-			return usagef("--image needs ZYMPLE_HOST and ZYMPLE_TOKEN; on the host use --digest")
-		}
-		fmt.Fprintf(env.Stdout, "==> push %s\n", *image)
-		pusher := client.Pusher{Runner: env.Runner}
-		if *digest, err = pusher.Push(ctx, c.RegistryHost(), app, c.Token, *image, env.Stdout); err != nil {
+	if len(images) > 0 && c.Token == "" {
+		return usagef("--image needs ZYMPLE_HOST and ZYMPLE_TOKEN; on the host use --digest")
+	}
+	pusher := client.Pusher{Runner: env.Runner}
+	for _, name := range sortedKeys(images) {
+		fmt.Fprintf(env.Stdout, "==> push %s\n", images[name])
+		digest, err := pusher.Push(ctx, c.RegistryHost(), app, c.Token, images[name], env.Stdout)
+		if err != nil {
 			return err
 		}
+		if !deploy.ValidDigest(digest) {
+			return fmt.Errorf("the push of %s reported %q, which is not a sha256 digest", imageLabel(name), digest)
+		}
+		digests[name] = digest
 	}
-	if !deploy.ValidDigest(*digest) {
-		return usagef("digest must be sha256:<64 hex characters>")
+	body := deployBody{Digest: digests[""]}
+	for _, name := range sortedKeys(digests) {
+		if name == "" {
+			fmt.Fprintf(env.Stdout, "==> deploy %s\n", digests[name])
+			continue
+		}
+		if body.Images == nil {
+			body.Images = map[string]string{}
+		}
+		body.Images[name] = digests[name]
+		fmt.Fprintf(env.Stdout, "==> deploy %s %s\n", name, digests[name])
 	}
-	fmt.Fprintf(env.Stdout, "==> deploy %s\n", *digest)
-	return c.Stream(ctx, http.MethodPost, apiApps+app+"/deploys", map[string]string{"digest": *digest}, printer(env))
+	return c.Stream(ctx, http.MethodPost, apiApps+app+"/deploys", body, printer(env))
+}
+
+// checkImageFlags refuses a deploy that names nothing, names an image both
+// ways, or gives something other than a digest to --digest.
+func checkImageFlags(images, digests imageFlags) error {
+	if len(images)+len(digests) == 0 {
+		return usagef("give --image or --digest")
+	}
+	for name := range images {
+		if _, both := digests[name]; both {
+			return usagef("give one of --image and --digest for %s", imageLabel(name))
+		}
+	}
+	for name, digest := range digests {
+		if !deploy.ValidDigest(digest) {
+			return usagef("the digest of %s must be sha256:<64 hex characters>", imageLabel(name))
+		}
+	}
+	return nil
 }
 
 func cmdRollback(ctx context.Context, args []string, env Env) error {
@@ -349,10 +421,22 @@ func cmdReleases(ctx context.Context, args []string, env Env) error {
 		if r.RolledBackFrom != 0 {
 			notes = append(notes, fmt.Sprintf("rollback from %d", r.RolledBackFrom))
 		}
+		for _, name := range sortedKeys(r.Images) {
+			notes = append(notes, printable(name+" "+shortDigest(r.Images[name])))
+		}
 		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", r.Number, printable(shortDigest(r.Digest)),
 			r.Time.Format(time.RFC3339), printable(r.By), strings.Join(notes, ", "))
 	}
 	return tw.Flush()
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func shortDigest(d string) string {
@@ -385,6 +469,9 @@ func cmdStatus(ctx context.Context, args []string, env Env) error {
 	} else {
 		fmt.Fprintf(env.Stdout, "release:   %d (%s, %s by %s)\n", st.Current.Number, printable(st.Current.Digest),
 			st.Current.Time.Format(time.RFC3339), printable(st.Current.By))
+		for _, name := range sortedKeys(st.Current.Images) {
+			fmt.Fprintf(env.Stdout, "image:     %s (%s)\n", printable(name), printable(st.Current.Images[name]))
+		}
 		fmt.Fprintf(env.Stdout, "web:       %s\n", map[bool]string{true: "running", false: "NOT RUNNING"}[st.WebRunning])
 	}
 	fmt.Fprintf(env.Stdout, "deploying: %v\n", st.Deploying)

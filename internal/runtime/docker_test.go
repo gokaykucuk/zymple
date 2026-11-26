@@ -283,8 +283,14 @@ func TestTags(t *testing.T) {
 		t.Errorf("listed tags with %q", call)
 	}
 	fake.Handler = nil
-	if err := d.Pin(ctx, "shop", digest, 7); err != nil || fake.Find("docker tag zymple/shop@"+digest+" zymple/shop:release-7") == "" {
+	if err := d.Pin(ctx, "shop", digest, 7, ""); err != nil || fake.Find("docker tag zymple/shop@"+digest+" zymple/shop:release-7") == "" {
 		t.Errorf("Pin: %v", fake.Calls())
+	}
+	if err := d.Pin(ctx, "shop", digest, 7, "ocr"); err != nil || fake.Find("docker tag zymple/shop@"+digest+" zymple/shop:release-7-ocr") == "" {
+		t.Errorf("Pin of an extra image: %v", fake.Calls())
+	}
+	if err := d.Repin(ctx, "shop", digest, 7, "ocr"); err != nil || fake.Find("docker tag "+digest+" zymple/shop:release-7-ocr") == "" {
+		t.Errorf("Repin of an extra image: %v", fake.Calls())
 	}
 	if err := d.RemoveTag(ctx, "shop", "push-abc"); err != nil || fake.Find("docker rmi zymple/shop:push-abc") == "" {
 		t.Errorf("RemoveTag: %v", fake.Calls())
@@ -393,6 +399,8 @@ func TestParseReleaseTag(t *testing.T) {
 		"", "release", "release-", "release-0", "release--1", "release-+1", "release-01", "release-1.4.0",
 		"release-1 ", "release-1a", "release-0x10", "release-1_000", "Release-1", "push-1", "1",
 		"release-99999999999999999999999999",
+		"release-1-", "release-1-OCR", "release-1-1x", "release-1-ocr-x", "release-01-ocr", "release-0-ocr",
+		"release-1-ocr ", "release-1-" + strings.Repeat("a", 32), "release--ocr", "release-1--ocr",
 	} {
 		if n, ok := ParseReleaseTag(tag); ok {
 			t.Errorf("ParseReleaseTag(%q) = %d, want it refused", tag, n)
@@ -400,15 +408,35 @@ func TestParseReleaseTag(t *testing.T) {
 	}
 }
 
+// The tags of a release's extra images are Zymple's own as well.
+func TestParseReleaseTagOfAnExtraImage(t *testing.T) {
+	for _, image := range []string{"ocr", "a", "a_b", "x9", strings.Repeat("a", 31)} {
+		tag := ImageTag(12, image)
+		if want := "release-12-" + image; tag != want {
+			t.Errorf("ImageTag = %q, want %q", tag, want)
+		}
+		if n, ok := ParseReleaseTag(tag); !ok || n != 12 {
+			t.Errorf("ParseReleaseTag(%q) = %d, %v", tag, n, ok)
+		}
+	}
+	if ImageTag(3, "") != ReleaseTag(3) {
+		t.Error("the app's own image keeps the plain release tag")
+	}
+}
+
 // FuzzParseReleaseTag: tags come from whoever pushes to the registry.
 func FuzzParseReleaseTag(f *testing.F) {
-	for _, seed := range []string{"release-1", "release-1.4.0", "release-", "release-007", "latest"} {
+	for _, seed := range []string{"release-1", "release-1.4.0", "release-", "release-007", "latest", "release-3-ocr", "release-3-a_b", "release-3-"} {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, tag string) {
 		n, ok := ParseReleaseTag(tag)
-		if ok && (n < 1 || ReleaseTag(n) != tag) {
-			t.Fatalf("ParseReleaseTag(%q) = %d, which is not what ReleaseTag writes", tag, n)
+		if !ok {
+			return
+		}
+		image := strings.TrimPrefix(strings.TrimPrefix(tag, ReleaseTag(n)), "-")
+		if n < 1 || ImageTag(n, image) != tag || (image != "" && !appdef.ValidImageName(image)) {
+			t.Fatalf("ParseReleaseTag(%q) = %d, which is not what ImageTag writes", tag, n)
 		}
 	})
 }

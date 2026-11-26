@@ -1568,3 +1568,88 @@ func TestPostgresImportRoute(t *testing.T) {
 	}
 	unlock()
 }
+
+// writeImagesApp is an app with an extra image, run by its own service.
+func writeImagesApp(t *testing.T, appsDir, name string) {
+	t.Helper()
+	writeApp(t, appsDir, name, "images: [ocr]\n")
+	writeFile(t, filepath.Join(appsDir, name, "compose.yml"),
+		"services:\n  web:\n    image: ${IMAGE}\n  ocr:\n    image: ${IMAGE_OCR}\n")
+}
+
+func TestDeployWithAnExtraImage(t *testing.T) {
+	f := newFixture(t, false)
+	writeImagesApp(t, f.appsDir, "docs")
+	if err := f.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	const path, docsToken = "/api/v1/apps/docs/deploys", "zym_docs_token"
+
+	// The first deploy has to bring every image.
+	code, _, events := call(f.network, "POST", path, docsToken, `{"digest":"`+digestA+`"}`)
+	if code != 200 || outcome(events).Status != "fail" || !strings.Contains(outcome(events).Message, "has not been deployed") {
+		t.Fatalf("deploy without the extra image: %d %+v", code, outcome(events))
+	}
+	f.ops.Wait()
+
+	code, body, events := call(f.network, "POST", path, docsToken, `{"digest":"`+digestA+`","images":{"ocr":"`+digestB+`"}}`)
+	if code != 200 || outcome(events).Status != "ok" {
+		t.Fatalf("deploy: %d %s", code, body)
+	}
+	f.ops.Wait()
+	for _, want := range []string{
+		"docker tag zymple/docs@" + digestA + " zymple/docs:release-1",
+		"docker tag zymple/docs@" + digestB + " zymple/docs:release-1-ocr",
+	} {
+		if f.fake.Find(want) == "" {
+			t.Errorf("missing %q in %v", want, f.fake.Calls())
+		}
+	}
+	rendered, err := os.ReadFile(filepath.Join(f.Config.StateDir, "apps", "docs", "releases", "1", "compose.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rendered), "zymple/docs@"+digestA) || !strings.Contains(string(rendered), "zymple/docs@"+digestB) {
+		t.Errorf("the rendered compose file does not pin both images:\n%s", rendered)
+	}
+	if code, body, _ := call(f.network, "GET", "/api/v1/apps/docs/status", docsToken, ""); code != 200 || !strings.Contains(body, `"images":{"ocr":"`+digestB+`"}`) {
+		t.Errorf("status: %d %s", code, body)
+	}
+
+	// Only the extra image: the app's own stays.
+	code, body, events = call(f.network, "POST", path, docsToken, `{"images":{"ocr":"`+digestA+`"}}`)
+	if code != 200 || outcome(events).Status != "ok" {
+		t.Fatalf("deploy of the extra image alone: %d %s", code, body)
+	}
+	f.ops.Wait()
+	if code, body, _ := call(f.network, "GET", "/api/v1/apps/docs/status", docsToken, ""); code != 200 ||
+		!strings.Contains(body, `"digest":"`+digestA+`"`) || !strings.Contains(body, `"images":{"ocr":"`+digestA+`"}`) {
+		t.Errorf("status: %d %s", code, body)
+	}
+}
+
+func TestDeployRejectsBadExtraImages(t *testing.T) {
+	f := newFixture(t, false)
+	writeImagesApp(t, f.appsDir, "docs")
+	if err := f.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct{ app, body string }{
+		"undeclared name":          {"docs", `{"digest":"` + digestA + `","images":{"pdf":"` + digestB + `"}}`},
+		"app without extra images": {"shop", `{"digest":"` + digestA + `","images":{"ocr":"` + digestB + `"}}`},
+		"tag for an extra image":   {"docs", `{"digest":"` + digestA + `","images":{"ocr":"latest"}}`},
+		"empty extra digest":       {"docs", `{"digest":"` + digestA + `","images":{"ocr":""}}`},
+		"empty name":               {"docs", `{"digest":"` + digestA + `","images":{"":"` + digestB + `"}}`},
+		"bad own digest":           {"docs", `{"digest":"latest","images":{"ocr":"` + digestB + `"}}`},
+		"images not a map":         {"docs", `{"digest":"` + digestA + `","images":["ocr"]}`},
+		"nothing at all":           {"docs", `{"images":{}}`},
+	} {
+		f.fake.Reset()
+		if code, _, _ := call(f.network, "POST", "/api/v1/apps/"+tc.app+"/deploys", "zym_"+tc.app+"_token", tc.body); code != 400 {
+			t.Errorf("%s: got %d, want 400", name, code)
+		}
+		if len(f.fake.Calls()) != 0 {
+			t.Errorf("%s: a refused request ran %v", name, f.fake.Calls())
+		}
+	}
+}

@@ -312,25 +312,39 @@ const ReleaseTagPrefix = "release-"
 // ReleaseTag is the local tag that pins a release's image against pruning.
 func ReleaseTag(release int) string { return ReleaseTagPrefix + strconv.Itoa(release) }
 
+// ImageTag is the tag that pins one image of a release: ReleaseTag for the
+// app's own image (image ""), release-<n>-<name> for an extra one.
+func ImageTag(release int, image string) string {
+	if image == "" {
+		return ReleaseTag(release)
+	}
+	return ReleaseTag(release) + "-" + image
+}
+
 // ParseReleaseTag returns the release a tag pins. Only the exact text
-// ReleaseTag produces counts: "release-1.4.0" and "release-07" are tags
+// ImageTag produces counts: "release-1.4.0" and "release-07" are tags
 // somebody else chose.
 func ParseReleaseTag(tag string) (int, bool) {
 	rest, ok := strings.CutPrefix(tag, ReleaseTagPrefix)
 	if !ok {
 		return 0, false
 	}
-	n, err := strconv.Atoi(rest)
-	if err != nil || n < 1 || ReleaseTag(n) != tag {
+	number, image, extra := strings.Cut(rest, "-")
+	if extra && !appdef.ValidImageName(image) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(number)
+	if err != nil || n < 1 || ImageTag(n, image) != tag {
 		return 0, false
 	}
 	return n, true
 }
 
-// Pin tags a release's image so image pruning cannot remove it.
-func (d *Docker) Pin(ctx context.Context, app, digest string, release int) error {
+// Pin tags one image of a release so image pruning cannot remove it. image
+// is "" for the app's own image.
+func (d *Docker) Pin(ctx context.Context, app, digest string, release int, image string) error {
 	_, err := execx.Output(ctx, d.Runner, "docker", "tag",
-		appdef.ImageRef(app, digest), appdef.Repository(app)+":"+ReleaseTag(release))
+		appdef.ImageRef(app, digest), appdef.Repository(app)+":"+ImageTag(release, image))
 	return err
 }
 
@@ -338,8 +352,8 @@ func (d *Docker) Pin(ctx context.Context, app, digest string, release int) error
 // Zymple removed it, typically `docker image prune -a`. It works only while
 // the image content is still on the host, for example because a running
 // container uses it.
-func (d *Docker) Repin(ctx context.Context, app, digest string, release int) error {
-	_, err := execx.Output(ctx, d.Runner, "docker", "tag", digest, appdef.Repository(app)+":"+ReleaseTag(release))
+func (d *Docker) Repin(ctx context.Context, app, digest string, release int, image string) error {
+	_, err := execx.Output(ctx, d.Runner, "docker", "tag", digest, appdef.Repository(app)+":"+ImageTag(release, image))
 	return err
 }
 

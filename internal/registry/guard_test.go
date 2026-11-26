@@ -49,6 +49,8 @@ func TestAuthorize(t *testing.T) {
 		// Zymple's own pin tags may be looked up but never moved by a push.
 		{"PUT", "/v2/zymple/shop/manifests/release-3", false},
 		{"HEAD", "/v2/zymple/shop/manifests/release-3", true},
+		{"PUT", "/v2/zymple/shop/manifests/release-3-ocr", false},
+		{"PUT", "/v2/zymple/shop/manifests/release-3-OCR", true},
 		{"PUT", "/v2/zymple/shop/manifests/release-1.4.0", true},
 		{"PUT", "/v2/zymple/shop/manifests/release-07", true},
 		{"HEAD", "/v2/zymple/shop/blobs/", false},
@@ -152,6 +154,9 @@ func FuzzAuthorize(f *testing.F) {
 	f.Add("GET", "/v2/zymple/shop/../other/blobs/x")
 	f.Add("POST", "/v2/zymple/shopx/blobs/uploads/")
 	f.Add("PUT", "/v2/zymple/shop/blobs/uploads/x/manifests/latest")
+	// A tag may contain dots: "0.." is a reference, not a way out.
+	f.Add("PUT", "/v2/zymple/shop/manifests/0..")
+	f.Add("PUT", "/v2/zymple/shop/manifests/..")
 	f.Fuzz(func(t *testing.T, method, path string) {
 		if !Authorize("shop", method, path) {
 			return
@@ -159,8 +164,15 @@ func FuzzAuthorize(f *testing.F) {
 		if path == "/v2" || path == "/v2/" {
 			return
 		}
-		if !strings.HasPrefix(path, "/v2/zymple/shop/") || strings.Contains(path, "..") || strings.Contains(path, "//") {
+		if !strings.HasPrefix(path, "/v2/zymple/shop/") || strings.Contains(path, "//") {
 			t.Fatalf("authorized a path outside the app's repository: %s %q", method, path)
+		}
+		// Dots inside a segment are part of a tag. A segment that is only
+		// dots is a step up or a no-op.
+		for _, segment := range strings.Split(path, "/") {
+			if segment == "." || segment == ".." {
+				t.Fatalf("authorized a path with a %q segment: %s %q", segment, method, path)
+			}
 		}
 		if method == "GET" && !strings.Contains(path, "/blobs/uploads") {
 			t.Fatalf("authorized a read: %q", path)

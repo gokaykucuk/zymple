@@ -11,9 +11,43 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ImagePlaceholder is the only image a service may name. Zymple replaces it
-// with the pinned digest of the release.
+// ImagePlaceholder is the image of the app itself. A service names it, or
+// the placeholder of one of the app's extra images; Zymple replaces either
+// with the digest the release pins.
 const ImagePlaceholder = "${IMAGE}"
+
+const (
+	extraImagePrefix = "${IMAGE_"
+	extraImageSuffix = "}"
+)
+
+// ImagePlaceholderFor is the placeholder of an extra image: ${IMAGE_OCR} for
+// the image named ocr.
+func ImagePlaceholderFor(name string) string {
+	return extraImagePrefix + strings.ToUpper(name) + extraImageSuffix
+}
+
+// PlaceholderImage returns the extra image a placeholder names, "" for the
+// app's own image. ok is false for anything that is not a placeholder. Only
+// the exact text ImagePlaceholderFor produces counts.
+func PlaceholderImage(s string) (name string, ok bool) {
+	if s == ImagePlaceholder {
+		return "", true
+	}
+	rest, found := strings.CutPrefix(s, extraImagePrefix)
+	if !found {
+		return "", false
+	}
+	rest, found = strings.CutSuffix(rest, extraImageSuffix)
+	if !found {
+		return "", false
+	}
+	name = strings.ToLower(rest)
+	if !ValidImageName(name) || ImagePlaceholderFor(name) != s {
+		return "", false
+	}
+	return name, true
+}
 
 var (
 	serviceRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
@@ -180,8 +214,9 @@ func validateService(svc map[string]any, declaredVolumes map[string]bool) error 
 			return fmt.Errorf("key %q is not allowed", key)
 		}
 	}
-	if image, _ := svc["image"].(string); image != ImagePlaceholder {
-		return fmt.Errorf("image must be exactly %s", ImagePlaceholder)
+	image, _ := svc["image"].(string)
+	if _, ok := PlaceholderImage(image); !ok {
+		return fmt.Errorf("image must be exactly %s, or %s for an image declared in app.yml", ImagePlaceholder, ImagePlaceholderFor("name"))
 	}
 	if err := rejectNonStringKeys(svc); err != nil {
 		return err
@@ -434,4 +469,11 @@ func Environment(svc map[string]any) (map[string]string, error) {
 		}
 	}
 	return env, nil
+}
+
+// Image returns the extra image a service runs, "" for the app's own.
+func (c *Compose) Image(service string) string {
+	image, _ := c.Services[service]["image"].(string)
+	name, _ := PlaceholderImage(image)
+	return name
 }

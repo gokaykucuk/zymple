@@ -38,6 +38,8 @@ func WebService(service string, release int) string {
 type RenderInput struct {
 	Release int
 	Digest  string
+	// Images holds the digest of each extra image the app declares.
+	Images map[string]string
 	// Port is the loopback port the web container is published on.
 	Port int
 	// Env is injected into every service (DATABASE_URL, REDIS_URL).
@@ -60,7 +62,11 @@ func (a *App) Render(in RenderInput) ([]byte, error) {
 			env[key] = val
 		}
 		out["environment"] = env
-		out["image"] = ImageRef(a.Name, in.Digest)
+		digest, err := a.serviceDigest(name, in)
+		if err != nil {
+			return nil, err
+		}
+		out["image"] = ImageRef(a.Name, digest)
 		out["pull_policy"] = "never"
 		out["security_opt"] = []string{"no-new-privileges:true"}
 		if _, ok := out["restart"]; !ok {
@@ -100,6 +106,20 @@ func (a *App) Render(in RenderInput) ([]byte, error) {
 	// Compose interpolates "$" in every string; escape what is left so env
 	// values pass through literally.
 	return []byte(strings.ReplaceAll(string(data), "$", "$$")), nil
+}
+
+// serviceDigest is the digest a service runs in a release: the app's own
+// image, or the extra image its placeholder names.
+func (a *App) serviceDigest(service string, in RenderInput) (string, error) {
+	image := a.Compose.Image(service)
+	if image == "" {
+		return in.Digest, nil
+	}
+	digest, ok := in.Images[image]
+	if !ok {
+		return "", fmt.Errorf("service %s: the release has no image %q", service, image)
+	}
+	return digest, nil
 }
 
 // OtherServices returns the compose services that are not the web service.

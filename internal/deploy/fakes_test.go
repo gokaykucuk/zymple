@@ -125,8 +125,17 @@ func (w *world) ImageExists(_ context.Context, _ string, digest string) (bool, e
 	return w.images[digest], nil
 }
 
-func (w *world) Repin(_ context.Context, _ string, digest string, release int) error {
-	if err := w.op("Repin", release); err != nil {
+// imageArgs is how Pin and Repin are logged: the release, then the image's
+// name when it is not the app's own.
+func imageArgs(release int, image string) []any {
+	if image == "" {
+		return []any{release}
+	}
+	return []any{release, image}
+}
+
+func (w *world) Repin(_ context.Context, _ string, digest string, release int, image string) error {
+	if err := w.op("Repin", imageArgs(release, image)...); err != nil {
 		return err
 	}
 	w.mu.Lock()
@@ -261,13 +270,13 @@ func (w *world) UpServices(_ context.Context, _ *appdef.App, release int, _ io.W
 	return w.op("UpServices", release)
 }
 
-func (w *world) Pin(_ context.Context, _ string, digest string, release int) error {
-	if err := w.op("Pin", release); err != nil {
+func (w *world) Pin(_ context.Context, _ string, digest string, release int, image string) error {
+	if err := w.op("Pin", imageArgs(release, image)...); err != nil {
 		return err
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.tags[runtime.ReleaseTag(release)] = digest
+	w.tags[runtime.ImageTag(release, image)] = digest
 	return nil
 }
 

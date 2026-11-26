@@ -26,6 +26,8 @@ const (
 	DefaultReleaseTimeout = time.Hour
 	DefaultPITRDays       = 14
 	maxFileSize           = 1 << 20
+	// MaxImages is how many extra images an app may declare.
+	MaxImages = 8
 )
 
 var (
@@ -33,7 +35,13 @@ var (
 	domainRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
 	digitsRe = regexp.MustCompile(`^[0-9]+$`)
 	pathRe   = regexp.MustCompile(`^/[A-Za-z0-9/_.\-?=&%]*$`)
+	// An image name becomes part of a tag (release-<n>-<name>) and of a
+	// compose placeholder (${IMAGE_<NAME>}), so it has no "-" and one case.
+	imageNameRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,30}$`)
 )
+
+// ValidImageName reports whether s can name one of an app's extra images.
+func ValidImageName(s string) bool { return imageNameRe.MatchString(s) }
 
 // Duration is a time.Duration that unmarshals from a string such as "30s".
 type Duration time.Duration
@@ -102,6 +110,11 @@ type App struct {
 	KeepReleases   int       `yaml:"keep_releases"`
 	Postgres       *Postgres `yaml:"postgres"`
 	Redis          *Redis    `yaml:"redis"`
+	// Images names the images the app runs besides its own, such as a
+	// document processor built from another Dockerfile. A compose service
+	// uses one by naming ${IMAGE_<NAME>}. They are pushed to the app's
+	// repository and pinned by each release together with the app's image.
+	Images []string `yaml:"images"`
 	// Env names the secrets file in the infra repo. On the host the file is
 	// always <dir>/env, so the value is accepted and ignored.
 	Env string `yaml:"env"`
@@ -152,6 +165,9 @@ func Parse(appYAML, composeYAML []byte) (*App, error) {
 	if err := app.checkServiceNames(compose); err != nil {
 		return nil, fmt.Errorf("compose: %w", err)
 	}
+	if err := app.checkImages(compose); err != nil {
+		return nil, fmt.Errorf("compose: %w", err)
+	}
 	app.Compose = compose
 	return &app, nil
 }
@@ -166,6 +182,46 @@ func (a *App) checkServiceNames(compose *Compose) error {
 		}
 	}
 	return nil
+}
+
+// checkImages ties the compose file's image placeholders to the images the
+// app declares. The web service runs the app's own image, because that is
+// the image the release command and `zymple run` use. An image nothing runs
+// is refused: every deploy would have to supply it for no reason.
+func (a *App) checkImages(compose *Compose) error {
+	declared := make(map[string]bool, len(a.Images))
+	for _, name := range a.Images {
+		declared[name] = false
+	}
+	for _, service := range compose.ServiceNames() {
+		name := compose.Image(service)
+		if name == "" {
+			continue
+		}
+		if _, ok := declared[name]; !ok {
+			return fmt.Errorf("service %s: image %q is not listed under images in app.yml", service, name)
+		}
+		if service == a.Web.Service {
+			return fmt.Errorf("service %s: the web service must use %s", service, ImagePlaceholder)
+		}
+		declared[name] = true
+	}
+	for _, name := range a.Images {
+		if !declared[name] {
+			return fmt.Errorf("image %q is declared in app.yml but no service uses %s", name, ImagePlaceholderFor(name))
+		}
+	}
+	return nil
+}
+
+// HasImage reports whether the app declares an extra image of that name.
+func (a *App) HasImage(name string) bool {
+	for _, declared := range a.Images {
+		if declared == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) reservedService(name string) string {
@@ -238,6 +294,9 @@ func (a *App) validate() error {
 	if err := a.Postgres.validate(); err != nil {
 		return err
 	}
+	if err := validateImages(a.Images); err != nil {
+		return err
+	}
 	if a.Redis != nil && !envNameRe.MatchString(a.Redis.Env) {
 		return fmt.Errorf("redis.env %q must match %s", a.Redis.Env, envNameRe)
 	}
@@ -274,6 +333,23 @@ func (a *App) checkInjectedEnv(compose *Compose) error {
 				return fmt.Errorf("service %s: environment %s is set by zymple", service, name)
 			}
 		}
+	}
+	return nil
+}
+
+func validateImages(images []string) error {
+	if len(images) > MaxImages {
+		return fmt.Errorf("at most %d images may be declared", MaxImages)
+	}
+	seen := make(map[string]bool, len(images))
+	for _, name := range images {
+		if !ValidImageName(name) {
+			return fmt.Errorf("image name %q must match %s", name, imageNameRe)
+		}
+		if seen[name] {
+			return fmt.Errorf("image %q is declared twice", name)
+		}
+		seen[name] = true
 	}
 	return nil
 }
