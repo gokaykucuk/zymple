@@ -167,6 +167,8 @@ func TestVersionHelpAndUsageErrors(t *testing.T) {
 		{"pg"}, {"pg", "info"}, {"pg", "frob", "shop"}, {"pg", "info", "BAD"}, {"pg", "backup"}, {"pg", "backup", "shop", "--bogus"},
 		{"pg", "restore", "shop"}, {"pg", "restore", "BAD", "--yes"}, {"pg", "restore", "shop", "--bogus"},
 		{"pg", "drill-rm", "shop"}, {"pg", "drill-rm", "BAD", "x"}, {"pg", "psql", "BAD"},
+		{"pg", "import", "shop", "/backups/prod.pgdump"}, {"pg", "import", "shop", "--yes"}, {"pg", "import", "BAD", "/x", "--yes"},
+		{"pg", "import", "shop", "/x", "--yes", "--jobs", "many"},
 		{"redis"}, {"redis", "flush", "shop"}, {"redis", "backup", "BAD"},
 		{"token"}, {"token", "generate"}, {"token", "generate", "BAD ID"}, {"token", "revoke", "x"},
 		{"server", "extra"}, {"server", "--bogus"},
@@ -355,6 +357,8 @@ func TestOperatorCommands(t *testing.T) {
 		{[]string{"pg", "restore", "shop", "--into", "drill"}, "POST /admin/apps/shop/pg/restore", `{"into":"drill","time":""}`},
 		{[]string{"pg", "restore", "shop", "--yes", "--time", "2026-01-02 15:04:05+00"}, "POST /admin/apps/shop/pg/restore", `{"into":"","time":"2026-01-02 15:04:05+00"}`},
 		{[]string{"pg", "drill-rm", "shop", "drill"}, "DELETE /admin/apps/shop/pg/drills/drill", ""},
+		{[]string{"pg", "import", "shop", "/backups/prod.pgdump", "--yes"}, "POST /admin/apps/shop/pg/import", `{"file":"/backups/prod.pgdump","jobs":0,"no_start":false}`},
+		{[]string{"pg", "import", "--yes", "--jobs", "8", "--no-start", "shop", "/backups/prod.pgdump"}, "POST /admin/apps/shop/pg/import", `{"file":"/backups/prod.pgdump","jobs":8,"no_start":true}`},
 		{[]string{"redis", "backup", "shop"}, "POST /admin/apps/shop/redis/backup", ""},
 		{[]string{"redis", "restore", "shop", "--yes"}, "POST /admin/apps/shop/redis/restore", ""},
 		{[]string{"redis", "restore", "--yes", "shop"}, "POST /admin/apps/shop/redis/restore", ""},
@@ -476,5 +480,16 @@ func TestStatusAndReleasesCannotDriveTheTerminal(t *testing.T) {
 		if strings.ContainsAny(out, "\x1b\x07") {
 			t.Errorf("%s printed control characters: %q", cmd, out)
 		}
+	}
+}
+
+func TestPGImportSendsAnAbsolutePath(t *testing.T) {
+	h := newHarness(t)
+	if code, _, stderr := h.run(false, "pg", "import", "shop", "prod.pgdump", "--yes"); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	wd, _ := os.Getwd()
+	if _, body := h.api.last(); !strings.Contains(body, `"file":"`+filepath.Join(wd, "prod.pgdump")+`"`) {
+		t.Errorf("the daemon was not sent an absolute path: %s", body)
 	}
 }

@@ -163,6 +163,17 @@ a backup and survives a deploy.
   `postgres:17` (the app role cannot run programs or read server files) and
   the restic restore command.
 
+### Importing a dump
+
+Unit tests cover which roles are read from a dump, the order of the steps,
+that only missing roles are created and that they are always dropped again,
+and which failures leave the database untouched. End to end, a real dump with
+objects owned by a foreign role, by the superuser and by a role the target
+has is imported into another app: the test checks rows, the owner of every
+kind of object, that the borrowed roles are gone, that `after-import.sql`
+ran, that the app's role can write and is still not a superuser, and that a
+file which is not an archive leaves the app serving.
+
 ### Host faults
 
 - Host reboot: the test host is restarted; every app comes back on its

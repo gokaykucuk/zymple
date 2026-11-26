@@ -182,6 +182,21 @@ Omit `--time` to restore to the latest archived state.
   plain decimal id. A definition that no longer validates is not loaded when
   the daemon starts, so check definitions before restarting.
 
+## Moving a database in from elsewhere
+
+Take a custom-format dump on the source (`pg_dump -Fc`), copy it to the host,
+deploy the app once so its database and roles exist, then:
+
+```bash
+zymple pg import myapp /root/myapp.pgdump --yes
+```
+
+This replaces the app's whole database. Read "Importing a dump" in the
+[spec](spec.md#importing-a-dump) first: it explains how ownership is mapped
+and what `after-import.sql` is for. If the dump is a copy of production, set
+whatever stops the app from sending mail or calling other services before you
+import, because the import starts the app.
+
 ## Rebuilding a host
 
 1. Provision the host and run the infra repo's roles, which install Docker,

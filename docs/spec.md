@@ -342,6 +342,8 @@ Operator commands, on the host:
 - `zymple pg restore <app> --into <name> [--time <ts>]`: a drill cluster
   beside the live one, with archiving off, reachable on the app's network as
   `postgres-drill-<name>`.
+- `zymple pg import <app> <dump-file> --yes [--jobs n] [--no-start]`: replace
+  the database with a custom-format `pg_dump` archive. See below.
 - `zymple pg drill-rm <app> <name>`: removes the container only when it
   carries this app's drill labels. A container name alone does not say whose
   it is: the drill `postgres` of app `a` and the database of an app called
@@ -353,6 +355,37 @@ now is reachable. A target time later than the last recorded transaction
 makes Postgres refuse to start; omit `--time` to restore to the end.
 
 A major version upgrade is a manual procedure in v1.
+
+### Importing a dump
+
+`pg import` moves a database in from somewhere else. It holds the deploy
+lock, stops the app, drops and recreates the database, restores the archive
+one section at a time, and starts the app again. If it fails before the
+database is dropped, the app is started again unchanged. If it fails after,
+the app stays stopped.
+
+A dump names the roles of the cluster it came from, and that cluster often
+ran the app as a superuser. Zymple's app role is an ordinary one, so the
+import maps ownership:
+
+- A role that already exists on the target keeps what it owns. Deploy the app
+  once before importing, so the roles its own migrations create exist and
+  keep their separation.
+- A role that does not exist is created for the restore. What it owns is
+  handed to the app's role, its grants are dropped, and the role is removed.
+- What the source's superuser owned is handed to the app's role, outside
+  extensions.
+
+Privileges that the source never recorded, because a superuser needs none,
+cannot be recovered from the dump. If `/etc/zymple/apps/<app>/after-import.sql`
+exists, the import runs it as the cluster's superuser in the app's database
+once the data is loaded. That is the place for the grants the app's role
+needs and for anything the app requires after a restore. The file is part of
+the app's definition, which only the host's operator writes.
+
+An imported copy of production holds real credentials and queued work.
+Whatever the app offers to keep a copy from acting on them must be set before
+the import, because the import starts the app.
 
 ## Redis
 

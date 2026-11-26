@@ -1474,3 +1474,97 @@ func TestNewReportsAnUnusableContainerdSocket(t *testing.T) {
 		t.Error("want an error")
 	}
 }
+
+func TestPostgresImportRoute(t *testing.T) {
+	f := newFixture(t, false)
+	writeApp(t, f.appsDir, "ledger", "postgres: { version: 17 }\n")
+	f.sim.inspect = "running stale"
+	if err := f.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, events := call(f.admin, "POST", "/api/v1/apps/ledger/deploys", "", `{"digest":"`+digestA+`"}`); code != 200 || outcome(events).Status != "ok" {
+		t.Fatalf("deploy ledger: %d %+v", code, events)
+	}
+	f.ops.Wait()
+	dump := filepath.Join(t.TempDir(), "prod.pgdump")
+	writeFile(t, dump, "archive")
+	body := `{"file":"` + dump + `","jobs":3}`
+	post := func(path, body string) deploy.Event {
+		t.Helper()
+		code, raw, events := call(f.admin, "POST", path, "", body)
+		if code != 200 {
+			t.Fatalf("POST %s: %d %s", path, code, raw)
+		}
+		f.ops.Wait()
+		return outcome(events)
+	}
+	position := func(sub string) int { return strings.Index(strings.Join(f.fake.Calls(), "\n"), sub) }
+
+	// Requests that must be refused before anything is stopped.
+	if code, _, _ := call(f.admin, "POST", "/admin/apps/shop/pg/import", "", body); code != 409 {
+		t.Errorf("import into an app without Postgres = %d, want 409", code)
+	}
+	for name, bad := range map[string]string{
+		"relative path": `{"file":"prod.pgdump"}`,
+		"missing file":  `{"file":"/nonexistent/prod.pgdump"}`,
+		"too many jobs": `{"file":"` + dump + `","jobs":99}`,
+		"not json":      `{`,
+	} {
+		if code, _, _ := call(f.admin, "POST", "/admin/apps/ledger/pg/import", "", bad); code != 400 {
+			t.Errorf("%s = %d, want 400", name, code)
+		}
+	}
+	if code, _, _ := call(f.network, "POST", "/admin/apps/ledger/pg/import", "zym_ledger_token", body); code != 404 {
+		t.Errorf("the import route is reachable from the network listener: %d", code)
+	}
+	if position("docker stop ledger-1") >= 0 {
+		t.Fatal("a refused import stopped the app")
+	}
+
+	// A successful import stops the app, loads the dump and starts the app.
+	f.fake.Reset()
+	if got := post("/admin/apps/ledger/pg/import", body); got.Status != "ok" {
+		t.Fatalf("import: %+v\n%v", got, f.fake.Calls())
+	}
+	stop, load, start := position("docker stop ledger-1"), position("--section=data --jobs=3"), position("docker start ledger-1")
+	if stop < 0 || !(stop < load && load < start) {
+		t.Errorf("the app must be stopped before and started after the load: stop=%d load=%d start=%d", stop, load, start)
+	}
+	if f.Engine.Busy("ledger") {
+		t.Error("the import did not release the deploy lock")
+	}
+
+	// --no-start leaves it stopped for the operator to inspect.
+	f.fake.Reset()
+	if got := post("/admin/apps/ledger/pg/import", `{"file":"`+dump+`","no_start":true}`); got.Status != "ok" || position("docker start ledger-1") >= 0 {
+		t.Errorf("no_start: %+v, started=%v", got, position("docker start ledger-1") >= 0)
+	}
+
+	// A failure after the database was dropped leaves the app stopped.
+	f.fake.Reset()
+	f.sim.failOn = "--section=data"
+	got := post("/admin/apps/ledger/pg/import", body)
+	if got.Status != "fail" || !strings.Contains(got.Message, "left stopped") || position("docker start ledger-1") >= 0 {
+		t.Errorf("failure after the drop: %+v, started=%v", got, position("docker start ledger-1") >= 0)
+	}
+
+	// A failure before it starts the app again, since nothing changed.
+	f.fake.Reset()
+	f.sim.failOn = "--schema-only"
+	got = post("/admin/apps/ledger/pg/import", body)
+	if got.Status != "fail" || !strings.Contains(got.Message, "not changed") || position("docker start ledger-1") < 0 {
+		t.Errorf("failure before the drop: %+v, started=%v", got, position("docker start ledger-1") >= 0)
+	}
+	f.sim.failOn = "docker stop ledger-1"
+	if got := post("/admin/apps/ledger/pg/import", body); got.Status != "fail" {
+		t.Errorf("import when the app cannot be stopped: %+v", got)
+	}
+	f.sim.failOn = ""
+
+	// An import refuses to run beside a deploy.
+	unlock, _ := f.Engine.Lock("ledger")
+	if got := post("/admin/apps/ledger/pg/import", body); got.Status != "fail" || !strings.Contains(got.Message, "in progress") {
+		t.Errorf("import during a deploy: %+v", got)
+	}
+	unlock()
+}
