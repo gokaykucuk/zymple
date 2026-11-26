@@ -495,6 +495,18 @@ func TestPostgresPointInTimeRecovery(t *testing.T) {
 // platform that ran the database as a superuser: objects owned by roles that
 // do not exist on the target, by the superuser itself, and by a role the
 // target does have.
+// Regression: the Postgres image had no certificate authorities, so
+// pgBackRest refused the certificate of every S3 endpoint and no backup
+// reached a bucket. The suite's own repository is a directory, which never
+// makes a TLS connection, so the image is checked directly.
+func TestPostgresImageTrustsPublicCertificates(t *testing.T) {
+	out := mustHost(t, "docker", "run", "--rm", "--entrypoint", "sh", postgresImage, "-c",
+		"grep -c 'BEGIN CERTIFICATE' /etc/ssl/certs/ca-certificates.crt")
+	if n, err := strconv.Atoi(strings.TrimSpace(out)); err != nil || n < 50 {
+		t.Fatalf("the Postgres image trusts %q certificate authorities, want the system set", out)
+	}
+}
+
 func TestImportDumpFromAnotherCluster(t *testing.T) {
 	src := newApp(t, "exporter", appOptions{postgres: true})
 	src.deploy(t, "v1")
