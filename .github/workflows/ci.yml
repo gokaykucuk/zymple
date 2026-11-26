@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UNC_VERSION: v0.1.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # unc's new-code detection needs the merge base
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+
+      # Install the pinned release binary instead of using the action, so
+      # that scripts/ci.sh runs unc the same way it does locally.
+      - name: Install unc
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dir="$RUNNER_TEMP/unc"
+          mkdir -p "$dir"
+          cd "$dir"
+          gh release download "$UNC_VERSION" -R gokaykucuk/uncomplicated \
+            -p unc-x86_64-unknown-linux-musl.tar.gz -p SHA256SUMS
+          sha256sum --check --ignore-missing SHA256SUMS
+          tar -xzf unc-x86_64-unknown-linux-musl.tar.gz
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: CI
+        env:
+          UNC_FORMAT: github
+          NEW_CODE_REF: origin/${{ github.base_ref || 'main' }}
+        run: ./scripts/ci.sh

@@ -1,0 +1,12 @@
+# Static analysis settings for unc (uncomplicated).
+# The default "Sonar way" quality gate applies: on new code, A ratings for
+# reliability, security and maintainability, coverage of at least 80%, and
+# at most 3% duplicated lines.
+# The new-code reference is passed by scripts/ci.sh, because the first push
+# has no base branch.
+
+[analysis]
+profile = "sonar-way"
+
+[coverage]
+go = ["coverage.out"]
