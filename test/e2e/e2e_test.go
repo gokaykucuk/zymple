@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -422,6 +423,67 @@ func TestZAggressivePruneIsSurvivable(t *testing.T) {
 	a.wantVersion(t, "v1")
 	if webs := a.webContainers(t); len(webs) != 1 {
 		t.Errorf("want exactly one web container, got %v", webs)
+	}
+}
+
+// TestStressSwitches repeats the traffic switch many times under load, to
+// catch races a single deploy rarely hits. It measures from two places: from
+// outside, through the host's published port, and from inside the host,
+// straight at Caddy with a new connection per request. Every failure is
+// logged with its time so it can be matched to a phase of a deploy.
+// Set ZYMPLE_E2E_STRESS to the number of cycles.
+func TestStressSwitches(t *testing.T) {
+	cycles, _ := strconv.Atoi(os.Getenv("ZYMPLE_E2E_STRESS"))
+	if cycles == 0 {
+		t.Skip("set ZYMPLE_E2E_STRESS=<cycles> to run")
+	}
+	a := newApp(t, "stress", appOptions{})
+	a.deploy(t, "v1")
+	a.deploy(t, "v2")
+
+	inside := `rm -f /tmp/stress.stop /tmp/stress.fail; n=0
+while [ ! -f /tmp/stress.stop ]; do
+  r=$(curl -s -o /dev/null -m 5 -w '%{http_code} exit=%{exitcode} connect=%{time_connect} total=%{time_total}' -H 'Host: stress.localhost' http://127.0.0.1:80/version)
+  n=$((n+1))
+  case "$r" in 200*) ;; *) echo "$(date -u +%H:%M:%S.%N | cut -c1-12) $r" >> /tmp/stress.fail ;; esac
+done; echo "$n" > /tmp/stress.total`
+	if out, err := exec.Command("docker", "exec", "-d", hostName, "sh", "-c", inside).CombinedOutput(); err != nil {
+		t.Fatalf("starting the inside load: %v %s", err, out)
+	}
+	l := a.startLoad()
+	stamp := func() string { return time.Now().UTC().Format("15:04:05.000") }
+	for i := 0; i < cycles; i++ {
+		var op, out string
+		switch i % 3 {
+		case 0:
+			op, out = "rollback", a.mustCLI(t, "rollback", a.name)
+		case 1:
+			op, out = "redeploy", mustHost(t, "zymple", "redeploy", a.name)
+		default:
+			op, out = "deploy", a.deploy(t, []string{"v1", "v2"}[i%2])
+		}
+		_ = out
+		t.Logf("%s cycle %d %s done", stamp(), i, op)
+	}
+	mustHost(t, "touch", "/tmp/stress.stop")
+	time.Sleep(7 * time.Second)
+	l.stop()
+	l.done.Wait()
+
+	insideFailures, _ := hostOutput("cat", "/tmp/stress.fail")
+	t.Logf("inside the host: %s requests, failures:\n%s", mustHost(t, "cat", "/tmp/stress.total"), insideFailures)
+	t.Logf("outside: %d requests, %d failed:\n%s", l.total.Load(), l.failed.Load(), l.failureLog())
+	if insideFailures != "" || l.failed.Load() != 0 {
+		// Everything needed to place the failures in a deploy's timeline.
+		for _, cmd := range []string{
+			`grep -E "msg=\"release is live\"|level=ERROR|level=WARN" /var/log/zymple.log | cut -c1-160 | tail -80`,
+			`grep -vE "incomplete response|cleaning storage|finished cleaning" /var/log/caddy.log | cut -c1-400 | tail -80`,
+			`docker events --since 30m --until 0s --filter type=container --filter event=start --filter event=die --filter event=kill --format '{{.Time}} {{.Action}} {{.Actor.Attributes.name}}' | grep stress | tail -150`,
+		} {
+			out, _ := hostOutput("sh", "-c", cmd)
+			t.Logf("$ %s\n%s", cmd, out)
+		}
+		t.Errorf("requests failed during the switches: inside %q, outside %d", insideFailures, l.failed.Load())
 	}
 }
 
