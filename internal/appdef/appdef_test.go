@@ -69,7 +69,8 @@ func TestParseDefaults(t *testing.T) {
 	}
 	if app.KeepReleases != DefaultKeepReleases || time.Duration(app.Web.HealthTimeout) != DefaultHealthTimeout ||
 		time.Duration(app.Web.Drain) != DefaultDrain || app.Web.Healthcheck != "/" ||
-		app.ComposeFile != "compose.yml" || app.Postgres.PITRDays != DefaultPITRDays {
+		app.ComposeFile != "compose.yml" || app.Postgres.PITRDays != DefaultPITRDays ||
+		time.Duration(app.ReleaseTimeout) != DefaultReleaseTimeout {
 		t.Fatalf("defaults not applied: %+v", app)
 	}
 }
@@ -109,6 +110,8 @@ func TestParseRejectsBadAppDefinitions(t *testing.T) {
 		"bad duration":        mutate(func(m map[string]any) { web(m)["health_timeout"] = "soon" }),
 		"numeric duration":    mutate(func(m map[string]any) { web(m)["health_timeout"] = []int{1} }),
 		"timeout too long":    mutate(func(m map[string]any) { web(m)["health_timeout"] = "11m" }),
+		"release too long":    mutate(func(m map[string]any) { m["release_timeout"] = "25h" }),
+		"release too short":   mutate(func(m map[string]any) { m["release_timeout"] = "10ms" }),
 		"timeout too short":   mutate(func(m map[string]any) { web(m)["health_timeout"] = "10ms" }),
 		"negative drain":      mutate(func(m map[string]any) { web(m)["drain"] = "-1s" }),
 		"drain too long":      mutate(func(m map[string]any) { web(m)["drain"] = "6m" }),

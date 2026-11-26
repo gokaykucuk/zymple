@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/gokaykucuk/zymple/internal/appdef"
 	"github.com/gokaykucuk/zymple/internal/config"
@@ -20,6 +22,71 @@ const RedisURL = "redis://redis:6379/0"
 type Redis struct {
 	Runner execx.Runner
 	Config *config.Config
+	// Sleep waits between checks on a running rewrite; nil uses a timer.
+	Sleep func(ctx context.Context, d time.Duration)
+}
+
+const (
+	// rewriteKey is the setting that lets Redis rewrite its append-only file
+	// on its own; rewriteDefault is the value Redis starts with.
+	rewriteKey     = "auto-aof-rewrite-percentage"
+	rewriteDefault = "100"
+	// rewriteChecks bounds the wait for a rewrite that is already running.
+	rewriteChecks   = 300
+	rewriteInterval = time.Second
+)
+
+func (r *Redis) sleep(ctx context.Context, d time.Duration) {
+	if r.Sleep != nil {
+		r.Sleep(ctx, d)
+		return
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+func (r *Redis) cli(ctx context.Context, name string, args ...string) (string, error) {
+	return execx.Output(ctx, r.Runner, "docker", append([]string{"exec", name, "redis-cli"}, args...)...)
+}
+
+// pauseRewrites keeps Redis from rewriting its append-only file while the
+// data directory is copied, and waits for a rewrite that is under way. A
+// rewrite replaces the files the manifest names; a copy taken across one can
+// hold a manifest that points at files the copy does not have, and Redis
+// refuses to start from that. The returned function lets rewrites go on.
+//
+// A Redis that is not running writes nothing, so there is nothing to pause.
+func (r *Redis) pauseRewrites(ctx context.Context, name string) (resume func(), err error) {
+	if out, err := r.cli(ctx, name, "CONFIG", "SET", rewriteKey, "0"); err != nil || out != "OK" {
+		if state, _ := inspect(ctx, r.Runner, name); state != "running" {
+			return func() {
+				// Nothing was paused.
+			}, nil
+		}
+		return nil, fmt.Errorf("could not pause append-only file rewrites: %v %s", err, out)
+	}
+	resume = func() {
+		_, _ = r.cli(context.WithoutCancel(ctx), name, "CONFIG", "SET", rewriteKey, rewriteDefault)
+	}
+	for check := 0; ; check++ {
+		info, err := r.cli(ctx, name, "INFO", "persistence")
+		if err != nil {
+			resume()
+			return nil, err
+		}
+		if !strings.Contains(info, "aof_rewrite_in_progress:1") {
+			return resume, nil
+		}
+		if check >= rewriteChecks || ctx.Err() != nil {
+			resume()
+			return nil, errors.New("an append-only file rewrite did not finish; try the backup again later")
+		}
+		r.sleep(ctx, rewriteInterval)
+	}
 }
 
 // RedisContainer is the name of an app's Redis container.
@@ -112,6 +179,11 @@ func (r *Redis) Backup(ctx context.Context, app *appdef.App, out io.Writer) erro
 			return err
 		}
 	}
+	resume, err := r.pauseRewrites(ctx, RedisContainer(app.Name))
+	if err != nil {
+		return err
+	}
+	defer resume()
 	backup, _, _ := r.restic(app.Name, true, "backup", "/data")
 	return dockerStream(ctx, r.Runner, out, env, backup...)
 }

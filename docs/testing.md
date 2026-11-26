@@ -57,6 +57,8 @@ Set `ZYMPLE_E2E_KEEP=1` to leave the host running for inspection.
   claiming its domain, leaves the app loaded, proxied and running.
 - Unit: cleanup leaves a freshly pushed tag it cannot account for alone for
   an hour, and removes a deploy's own push tag at once.
+- Unit: a release command that never returns is aborted at its timeout, its
+  container is removed, the lock is released and the next deploy works.
 
 ### Zero downtime
 
@@ -87,6 +89,8 @@ switched.
 - A path the registry would read as a repository nested under the app's own
   is refused, and no image is created from it.
 - An app can hold only a bounded number of log streams open.
+- A push cannot move a `release-<n>` tag.
+- The client does not follow a redirect, so the token is not sent on.
 - The CLI replaces terminal control sequences in output it prints.
 - A caller-supplied digest whose content exists only under another app is
   refused.
@@ -107,7 +111,8 @@ and a lookup of a layer as a manifest is answered without reading it. An
 empty or junk upload under another app's digest is refused against a store
 that, like the containerd daemon, reports "already exists" without checking
 the bytes. An index naming a manifest that was only uploaded as a blob is
-refused.
+refused. An upload sent in several requests holds one lease, not one per
+request.
 Fuzzing asserts that a repository which owns no blobs can never store a
 manifest.
 
@@ -146,7 +151,12 @@ a backup and survives a deploy.
 - Unit: role setup on a new cluster and on one whose superuser is still
   `app`; a failed Redis restore starts Redis again; database containers are
   stopped gracefully before they are replaced; a drill is removed only
-  when the container carries the app's drill labels.
+  when the container carries the app's drill labels, and a container
+  labelled as another app's is never replaced as this app's database.
+- Unit: after a restore the role setup waits for the server to leave
+  recovery. The end-to-end restore found this on a fast machine.
+- Unit: a Redis backup pauses append-only file rewrites around the copy,
+  waits for one under way, and copies nothing when it cannot.
 - Fuzzing asserts that accepted restore options only ever produce arguments
   of the validated shape.
 - By hand against real images, not yet in the suite: the role split on

@@ -32,6 +32,8 @@ type recorder struct {
 	requests []string
 	bodies   []string
 	fail     bool
+	// hostile makes the recorded state carry terminal control sequences.
+	hostile bool
 }
 
 func (r *recorder) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -40,18 +42,22 @@ func (r *recorder) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.requests = append(r.requests, req.Method+" "+req.URL.RequestURI())
 	r.bodies = append(r.bodies, strings.TrimSpace(string(body)))
 	fail := r.fail
+	by, lastError := "ci", "health: status 500"
+	if r.hostile {
+		by, lastError = "ci\x1b[2J", "logs: \x1b]0;owned\x07 done"
+	}
 	r.mu.Unlock()
 	enc := json.NewEncoder(w)
 	path := req.URL.Path
 	switch {
 	case strings.HasSuffix(path, "/releases"):
 		_ = enc.Encode(map[string]any{"current": 2, "releases": []releases.Release{
-			{Number: 1, Digest: digest, Time: time.Unix(100, 0).UTC(), By: "ci"},
+			{Number: 1, Digest: digest, Time: time.Unix(100, 0).UTC(), By: by},
 			{Number: 2, Digest: digest, Time: time.Unix(200, 0).UTC(), By: "admin", RolledBackFrom: 1},
 		}})
 	case strings.HasSuffix(path, "/status"):
-		st := map[string]any{"deploying": false, "web_running": !fail, "last_error": "health: status 500",
-			"current": releases.Release{Number: 2, Digest: digest, Time: time.Unix(200, 0).UTC(), By: "ci"}}
+		st := map[string]any{"deploying": false, "web_running": !fail, "last_error": lastError,
+			"current": releases.Release{Number: 2, Digest: digest, Time: time.Unix(200, 0).UTC(), By: by}}
 		if strings.Contains(path, "/empty/") {
 			st = map[string]any{"deploying": true}
 		}
@@ -350,7 +356,8 @@ func TestOperatorCommands(t *testing.T) {
 		{[]string{"pg", "restore", "shop", "--yes", "--time", "2026-01-02 15:04:05+00"}, "POST /admin/apps/shop/pg/restore", `{"into":"","time":"2026-01-02 15:04:05+00"}`},
 		{[]string{"pg", "drill-rm", "shop", "drill"}, "DELETE /admin/apps/shop/pg/drills/drill", ""},
 		{[]string{"redis", "backup", "shop"}, "POST /admin/apps/shop/redis/backup", ""},
-		{[]string{"redis", "restore", "shop"}, "POST /admin/apps/shop/redis/restore", ""},
+		{[]string{"redis", "restore", "shop", "--yes"}, "POST /admin/apps/shop/redis/restore", ""},
+		{[]string{"redis", "restore", "--yes", "shop"}, "POST /admin/apps/shop/redis/restore", ""},
 	}
 	for _, c := range cases {
 		code, _, stderr := h.run(false, c.args...)
@@ -372,6 +379,18 @@ func TestOperatorCommands(t *testing.T) {
 	code, _, stderr := h.run(false, "pg", "restore", "shop", "--time", "2026-01-02 15:04:05+00")
 	if after, _ := h.api.last(); code != 2 || !strings.Contains(stderr, "--yes") || after != before {
 		t.Errorf("unconfirmed in-place restore: exit %d, request sent: %v", code, after != before)
+	}
+
+	// Regression: a Redis restore, which replaces the data, asked for no
+	// confirmation at all.
+	code, _, stderr = h.run(false, "redis", "restore", "shop")
+	if after, _ := h.api.last(); code != 2 || !strings.Contains(stderr, "--yes") || after != before {
+		t.Errorf("unconfirmed Redis restore: exit %d, request sent: %v", code, after != before)
+	}
+	for _, args := range [][]string{{"redis", "backup"}, {"redis", "backup", "shop", "extra"}, {"redis", "restore", "shop", "--bogus"}} {
+		if code, _, _ := h.run(false, args...); code != 2 {
+			t.Errorf("%v: exit %d, want a usage error", args, code)
+		}
 	}
 
 	// psql attaches the terminal to the database container directly.
@@ -441,5 +460,21 @@ func TestPrintableKeepsColoursAndNothingElse(t *testing.T) {
 	show(deploy.Event{Step: "health", Status: "fail", Message: "x\x1b[1A"})
 	if strings.Contains(out.String(), "\x1b") {
 		t.Errorf("an escape sequence reached the terminal: %q", out.String())
+	}
+}
+
+// Regression: status and releases printed the recorded error and token id
+// as they came, while every event line went through printable.
+func TestStatusAndReleasesCannotDriveTheTerminal(t *testing.T) {
+	h := newHarness(t)
+	h.api.hostile = true
+	for _, cmd := range []string{"status", "releases"} {
+		code, out, _ := h.run(true, cmd, "shop")
+		if code != 0 {
+			t.Fatalf("%s: exit %d", cmd, code)
+		}
+		if strings.ContainsAny(out, "\x1b\x07") {
+			t.Errorf("%s printed control characters: %q", cmd, out)
+		}
 	}
 }

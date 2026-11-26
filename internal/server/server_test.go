@@ -66,6 +66,9 @@ func (d *dockerSim) handle(c execx.Cmd) (string, error) {
 				return "", errors.New("Error response from daemon: No such image")
 			}
 		}
+	case strings.HasPrefix(line, "docker inspect") && strings.Contains(line, appdef.LabelRole) && strings.Contains(d.inspect, "running"):
+		// A state answer is set: the container carries no owner labels.
+		return "\n", nil
 	case strings.HasPrefix(line, "docker inspect"):
 		if d.inspect == "" {
 			return "", errors.New("no such container")

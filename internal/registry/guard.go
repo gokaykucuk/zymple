@@ -9,6 +9,7 @@ import (
 
 	"github.com/gokaykucuk/zymple/internal/appdef"
 	"github.com/gokaykucuk/zymple/internal/auth"
+	"github.com/gokaykucuk/zymple/internal/runtime"
 )
 
 // TokenLookup returns the tokens accepted for an app, and whether it exists.
@@ -89,10 +90,33 @@ func Authorize(app, method, urlPath string) bool {
 		return false
 	case strings.HasPrefix(rest, "blobs/"):
 		return method == http.MethodHead && isLeaf(rest, "blobs/")
-	case strings.HasPrefix(rest, "manifests/"):
-		return (method == http.MethodHead || method == http.MethodPut) && isLeaf(rest, "manifests/")
+	case strings.HasPrefix(rest, manifestsPrefix):
+		return manifestAllowed(method, rest)
 	}
 	return false
+}
+
+const manifestsPrefix = "manifests/"
+
+// manifestAllowed decides a request for one manifest: an existence check, or
+// an upload under any reference but a release tag.
+func manifestAllowed(method, rest string) bool {
+	if !isLeaf(rest, manifestsPrefix) {
+		return false
+	}
+	if method == http.MethodPut {
+		return !pinsRelease(strings.TrimPrefix(rest, manifestsPrefix))
+	}
+	return method == http.MethodHead
+}
+
+// pinsRelease reports whether a manifest reference is one of the tags Zymple
+// itself puts on the images of kept releases. A push may not move one: the
+// image it named would lose its only name, and with it the content a
+// rollback to that release needs.
+func pinsRelease(reference string) bool {
+	_, own := runtime.ParseReleaseTag(reference)
+	return own
 }
 
 func isLeaf(rest, prefix string) bool {

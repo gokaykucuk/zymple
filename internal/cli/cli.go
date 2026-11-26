@@ -46,7 +46,8 @@ On the host (uses the operator socket):
   redeploy <app>                 new release of the current image
   run <app> -- <command...>      run a command in a one-off container
   pg info|backup|restore|psql|drill-rm <app>
-  redis backup|restore <app>
+  redis backup <app>
+  redis restore <app> --yes
 
 Anywhere:
   token generate <id>            create a deploy token and its hash line
@@ -346,8 +347,8 @@ func cmdReleases(ctx context.Context, args []string, env Env) error {
 		if r.RolledBackFrom != 0 {
 			notes = append(notes, fmt.Sprintf("rollback from %d", r.RolledBackFrom))
 		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", r.Number, shortDigest(r.Digest),
-			r.Time.Format(time.RFC3339), r.By, strings.Join(notes, ", "))
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", r.Number, printable(shortDigest(r.Digest)),
+			r.Time.Format(time.RFC3339), printable(r.By), strings.Join(notes, ", "))
 	}
 	return tw.Flush()
 }
@@ -380,13 +381,14 @@ func cmdStatus(ctx context.Context, args []string, env Env) error {
 	if st.Current == nil {
 		fmt.Fprintln(env.Stdout, "release:   none")
 	} else {
-		fmt.Fprintf(env.Stdout, "release:   %d (%s, %s by %s)\n", st.Current.Number, st.Current.Digest,
-			st.Current.Time.Format(time.RFC3339), st.Current.By)
+		fmt.Fprintf(env.Stdout, "release:   %d (%s, %s by %s)\n", st.Current.Number, printable(st.Current.Digest),
+			st.Current.Time.Format(time.RFC3339), printable(st.Current.By))
 		fmt.Fprintf(env.Stdout, "web:       %s\n", map[bool]string{true: "running", false: "NOT RUNNING"}[st.WebRunning])
 	}
 	fmt.Fprintf(env.Stdout, "deploying: %v\n", st.Deploying)
 	if st.LastError != "" {
-		fmt.Fprintf(env.Stdout, "last failed deploy: %s\n", st.LastError)
+		// The error can quote what a container printed.
+		fmt.Fprintf(env.Stdout, "last failed deploy: %s\n", printable(st.LastError))
 	}
 	if st.Current != nil && !st.WebRunning {
 		return errors.New("the current release's web container is not running")
@@ -516,12 +518,25 @@ func cmdPG(ctx context.Context, args []string, env Env) error {
 }
 
 func cmdRedis(ctx context.Context, args []string, env Env) error {
-	if len(args) != 2 || (args[0] != "backup" && args[0] != "restore") {
-		return usagef("usage: zymple redis backup|restore <app>")
+	const redisUsage = "usage: zymple redis backup <app> | redis restore <app> --yes"
+	if len(args) < 2 || (args[0] != "backup" && args[0] != "restore") {
+		return usagef(redisUsage)
 	}
-	app, err := appName(args[1])
+	fs := newFlags("redis "+args[0], env)
+	yes := fs.Bool("yes", false, "")
+	pos, err := parse(fs, args[1:])
 	if err != nil {
 		return err
+	}
+	if len(pos) != 1 {
+		return usagef(redisUsage)
+	}
+	app, err := appName(pos[0])
+	if err != nil {
+		return err
+	}
+	if args[0] == "restore" && !*yes {
+		return usagef("a restore stops the Redis of %s and replaces its data with the latest backup; pass --yes to confirm", app)
 	}
 	return adminStream(ctx, env, http.MethodPost, adminApps+app+"/redis/"+args[0], nil)
 }

@@ -108,6 +108,38 @@ type Engine struct {
 // deploy; removing it would make that deploy fail with an unknown digest.
 const pushTagGrace = time.Hour
 
+// Limits on the steps of a deploy that run a command. Without them a command
+// that never returns would hold the app's lock until the daemon is restarted,
+// and nothing else could be done to the app in the meantime: no deploy, no
+// rollback, no restore.
+const (
+	// startTimeout bounds starting the new web container.
+	startTimeout = 10 * time.Minute
+	// postSwitchTimeout bounds the work after the commit, on top of the
+	// app's drain period.
+	postSwitchTimeout = 15 * time.Minute
+)
+
+// bounded runs fn with a deadline and says so when the deadline is what
+// ended it.
+func bounded(ctx context.Context, limit time.Duration, what string, fn func(ctx context.Context) error) error {
+	ctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	err := fn(ctx)
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%s did not finish within %s: %w", what, limit, err)
+	}
+	return err
+}
+
+// releaseTimeout is the app's limit for its release command.
+func releaseTimeout(app *appdef.App) time.Duration {
+	if d := time.Duration(app.ReleaseTimeout); d > 0 {
+		return d
+	}
+	return appdef.DefaultReleaseTimeout
+}
+
 // maxLogLine bounds one line of command output. Output without a newline is
 // cut into lines of this size instead of growing in memory.
 const maxLogLine = 64 << 10
@@ -310,12 +342,20 @@ func (e *Engine) run(ctx context.Context, req request, st *releases.State, sink 
 	}
 
 	if len(app.Release) > 0 && !req.skipRelease {
-		if err := steps.do("release", func() error { return e.Runtime.RunRelease(ctx, app, number, out) }); err != nil {
+		if err := steps.do("release", func() error {
+			return bounded(ctx, releaseTimeout(app), "the release command", func(ctx context.Context) error {
+				return e.Runtime.RunRelease(ctx, app, number, out)
+			})
+		}); err != nil {
 			return abort(err)
 		}
 	}
 	out.step = "start"
-	if err := steps.do("start", func() error { return e.Runtime.StartWeb(ctx, app, number, out) }); err != nil {
+	if err := steps.do("start", func() error {
+		return bounded(ctx, startTimeout, "starting the web container", func(ctx context.Context) error {
+			return e.Runtime.StartWeb(ctx, app, number, out)
+		})
+	}); err != nil {
 		return abort(err)
 	}
 	if err := steps.do("health", func() error {
@@ -352,7 +392,8 @@ func (e *Engine) run(ctx context.Context, req request, st *releases.State, sink 
 
 	// The release is live. Nothing below can fail the deploy; problems are
 	// reported and the next deploy or reconcile retries them.
-	post := context.WithoutCancel(ctx)
+	post, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(app.Web.Drain)+postSwitchTimeout)
+	defer cancel()
 	e.afterSwitch(post, app, st, previous, number, sink)
 	return rel, nil
 }

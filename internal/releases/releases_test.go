@@ -110,3 +110,21 @@ func TestPendingTagsRoundTrip(t *testing.T) {
 		t.Errorf("empty pending_tags was written: %s", data)
 	}
 }
+
+// A rename is only durable once its directory is flushed.
+func TestWriteFileAtomicSyncsTheDirectory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state", "file")
+	if err := WriteFileAtomic(path, []byte("one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "one" {
+		t.Fatalf("content = %q, %v", data, err)
+	}
+	if err := syncDir(filepath.Join(dir, "state")); err != nil {
+		t.Errorf("syncing an existing directory: %v", err)
+	}
+	if err := syncDir(filepath.Join(dir, "missing")); err == nil {
+		t.Error("syncing a missing directory reported no error")
+	}
+}
