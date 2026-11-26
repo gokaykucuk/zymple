@@ -1,0 +1,59 @@
+name: Postgres image
+
+# Publishes ghcr.io/<owner>/zymple-postgres:<major>. Rebuilt weekly so that
+# Postgres minor releases and pgBackRest updates arrive without a code change.
+on:
+  push:
+    branches: [main]
+    paths: ["images/postgres/**", ".github/workflows/postgres-image.yml"]
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        major: [14, 15, 16, 17, 18]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and push one architecture
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAJOR: ${{ matrix.major }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/zymple-postgres"
+          arch="$(dpkg --print-architecture)"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --pull --build-arg "PG_MAJOR=$MAJOR" -t "$image:$MAJOR-$arch" images/postgres
+          # The image must contain a working pgBackRest before it is published.
+          docker run --rm --entrypoint pgbackrest "$image:$MAJOR-$arch" version
+          docker push "$image:$MAJOR-$arch"
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        major: [14, 15, 16, 17, 18]
+    steps:
+      - name: Publish the multi-architecture tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAJOR: ${{ matrix.major }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/zymple-postgres"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create -t "$image:$MAJOR" "$image:$MAJOR-amd64" "$image:$MAJOR-arm64"
+          docker buildx imagetools inspect "$image:$MAJOR"

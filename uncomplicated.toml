@@ -10,3 +10,9 @@ profile = "sonar-way"
 
 [coverage]
 go = ["coverage.out"]
+
+# Cognitive complexity is a rule for production code. SonarQube applies it to
+# main sources only; table-driven tests and their fakes are long by design.
+[[ignore]]
+rule = "go:S3776"
+paths = ["**/*_test.go"]

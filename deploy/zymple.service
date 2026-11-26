@@ -1,0 +1,33 @@
+[Unit]
+Description=Zymple deploy daemon
+Documentation=https://github.com/gokaykucuk/zymple
+After=docker.service caddy.service network-online.target
+Requires=docker.service
+Wants=caddy.service network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/zymple server --config /etc/zymple/zymple.yml
+ExecReload=/usr/local/bin/zymple reload
+Restart=always
+RestartSec=2
+# A deploy in flight is allowed to finish before the daemon stops.
+TimeoutStopSec=600
+RuntimeDirectory=zymple
+RuntimeDirectoryMode=0750
+StateDirectory=zymple
+# Zymple needs the Docker and containerd sockets, so it runs as root. These
+# settings remove what it does not need on top of that.
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -2,12 +2,12 @@
 
 Zymple holds the Docker socket and sits on the deploy path of production
 apps. It is only worth having if it is more trustworthy than the tools it
-replaces, so tests are part of the design, not an afterthought.
+replaces, so tests are part of the design.
 
 ## Rules
 
-1. `just ci` runs the same checks locally as GitHub runs. A change that does
-   not pass it is not merged.
+1. `just ci` runs the same script GitHub runs. A change that does not pass it
+   is not merged.
 2. Every step of the deploy sequence has a failure-injection test before the
    step is merged.
 3. Every bug fix comes with a test that fails without the fix.
@@ -16,75 +16,131 @@ replaces, so tests are part of the design, not an afterthought.
 
 ## Layers
 
-| Layer | What it proves | Runs |
+| Layer | Where | Runs |
 |---|---|---|
-| Static analysis | No vet findings, no `unc` issues at major or above, quality gate passes, no known-vulnerable dependencies | Every push |
-| Unit | Pure logic: app and compose validation, token checks, release bookkeeping, the deploy state machine against fakes | Every push, with the race detector and shuffled order |
-| Fuzz | Parsers and decoders never panic and never accept what validation rejects | Short run every push, long run nightly |
-| Integration | Real Docker with the containerd image store and real Caddy on the CI runner | Every push |
-| End to end | A fresh Debian VM, installed the way production is | Nightly and before a release |
+| Static analysis: `gofmt`, `go vet`, `unc`, `govulncheck` | `scripts/ci.sh` | Every push |
+| Unit tests with the race detector and shuffled order | `internal/**` | Every push |
+| Fuzzing, 5 seconds per target | `scripts/fuzz.sh` | Every push |
+| Fuzzing, 5 minutes per target | `.github/workflows/nightly.yml` | Nightly |
+| End to end | `test/e2e`, `scripts/e2e.sh` | Every push and nightly |
 
-## What the tests must cover
+## How the end-to-end suite works
+
+`just e2e` builds a throwaway "server": a privileged Docker-in-Docker
+container with the containerd image store and Caddy. It installs the Linux
+build of Zymple into it, then drives it from outside with the real CLI and
+the real docker client, the way CI would. Nothing in the path is faked: image
+layers travel through Caddy into the embedded registry and into containerd,
+containers are started by docker compose, and Postgres is a real cluster
+archiving to a pgBackRest repository.
+
+Set `ZYMPLE_E2E_KEEP=1` to leave the host running for inspection.
+
+## What is covered
 
 ### Deploy state machine
 
-- For each step, inject a failure and assert: the old release is still
-  serving, no container or Caddy snippet from the failed attempt remains, and
-  the lock is released.
-- Kill the server process at each step, restart it, and assert it converges
-  to one healthy release with nothing orphaned.
-- Two deploys for the same app at once: exactly one runs.
+- Unit: a failure is injected into every step up to the switch. Each case
+  asserts the old release still serves, the new container and its compose
+  file are gone, the port is returned, the lock is released, and the next
+  deploy works.
+- Unit: a failure in every step after the switch does not fail the deploy.
+- Unit: failing to record the release switches traffic back.
+- End to end: the daemon is killed with SIGKILL while a new container waits
+  for its health check, and again while the old one drains. After a restart
+  it converges back in the first case and forward in the second, with no
+  failed requests.
+- Two operations on one app at once: exactly one runs.
 
 ### Zero downtime
 
-A load generator runs against the app throughout. Zero failed requests
-during: a successful deploy, a deploy that fails its health check, a
-rollback, and a `zymple reload`.
+A load generator runs against the app through Caddy and every non-200 answer
+is a test failure. Covered: a successful deploy, a rollback, a redeploy, a
+reload, a deploy that fails its health check, both crash-recovery cases, and
+an aggressive image prune followed by a reload.
 
 ### Authentication and isolation
 
-- A full matrix of token against operation. App A's token must fail every
-  registry and API call for app B, including cross-repository blob mounts.
-- No token, a malformed token and a revoked token fail every route.
-- Operator commands are unreachable from the network listener.
-- Pushes are tested with `docker push`, `docker buildx --push` and `crane`,
-  single and multi-arch.
+- A matrix of token against route, in unit tests and end to end: no token, a
+  wrong token, another app's token, an unknown app, own token.
+- App A's token cannot push to or deploy app B, read any manifest or blob,
+  list the catalog, or push outside the `zymple/` namespace.
+- The operator routes return 404 on the network listener.
+- Fuzzing asserts that no accepted registry path leaves the app's repository
+  and that no read is ever authorised.
+- A caller-supplied digest whose content exists only under another app is
+  refused.
+
+### Registry
+
+The storage backend runs in unit tests against containerd's real content,
+image and lease stores on a temporary directory, with no daemon. A whole push
+is made over HTTP through the token guard: chunked and single-request
+uploads, existence checks, a manifest, a tag. The tests then read the image
+back from the image store and check the garbage-collection labels that keep
+its layers alive. They also cover what must be refused: content that does not
+match its digest, a manifest that is malformed or references blobs that were
+never uploaded, reads, deletes, other repositories and cross-repository
+mounts.
 
 ### Compose validation
 
-A corpus of escape attempts that must all be rejected: privileged mode, host
-networking and PID namespace, host bind mounts, the Docker socket, added
-capabilities, devices, `build:`, published ports, and YAML anchors or merges
-that hide any of them. New bypass ideas are added to the corpus first.
+A corpus of 61 escape attempts that must all be rejected: privileged mode,
+host namespaces, capabilities, devices, the Docker socket, host bind mounts
+in every syntax, volume driver options, `build:`, published ports, other
+images, interpolation, root users, YAML anchors and merge keys, `extends`,
+`include`, and more. Fuzzing asserts that whatever the validator accepts
+renders to a file containing only allow-listed keys. New bypass ideas go into
+the corpus first.
 
 ### Releases and rollback
 
-- After `keep_releases + n` deploys, exactly `keep_releases` images remain
-  pinned and a system-wide Docker prune removes none of them.
-- Rollback to the oldest kept release works with the network unplugged from
-  the registry path.
+- After more deploys than `keep_releases`, exactly that many images remain
+  tagged, and `docker image prune` removes none of them.
+- Rollback works from the host with no push.
+- `docker image prune -a` is survivable: running releases keep serving, a
+  reload restores their image names, and a rollback to a lost image either
+  succeeds from surviving content or is refused cleanly.
 
 ### Postgres
 
-- An automated PITR drill against a local S3 server: write timestamped rows,
-  restore to a chosen time, assert exactly the rows before it exist.
-- Restore into a second cluster while the first keeps serving.
-- A backup taken by version N restores with version N+1.
+End to end, against a real cluster: rows are written before and after a
+recorded time, the cluster is restored to that time, and exactly the earlier
+rows exist. This runs twice: into a drill cluster while the live one keeps
+serving, and in place. Afterwards the restored cluster accepts writes, takes
+a backup and survives a deploy.
 
-### Upgrades and host faults
+### Host faults
 
-- Upgrade Zymple from the previous release with apps running: zero failed
-  requests, releases intact.
-- Host reboot: every app comes back on its recorded release.
-- Disk full during a push and during a deploy: the old release keeps
-  serving and the error is reported.
+- Host reboot: the test host is restarted; every app comes back on its
+  recorded release and deploys normally afterwards.
+- A Postgres container that keeps crashing fails the deploy quickly with the
+  container's logs, instead of waiting out the readiness timeout.
 
-## Tooling
+## Not covered yet
 
-- [`unc`](https://github.com/gokaykucuk/uncomplicated) is the static
-  analyser, locally and in CI, with its default quality gate plus
-  `--fail-on major`.
-- `go vet`, `gofmt`, `go mod tidy -diff`, and `go test -race -shuffle=on`.
-- `govulncheck` for dependencies.
-- GitHub Actions are pinned by commit SHA. Tool versions are pinned in
-  `scripts/ci.sh` and the workflow.
+- S3 backup repositories end to end. The tests use a directory repository;
+  the S3 settings Zymple generates are unit-tested only.
+- Redis backup and restore end to end.
+- Upgrading Zymple from a previous release with apps running.
+- Disk-full behaviour during a push or a deploy.
+- Pushing with `buildx --push` or `crane`, and multi-architecture images. The
+  CLI pushes with `docker push`, which is what the tests exercise.
+- The systemd unit.
+
+## Static analysis settings
+
+[`unc`](https://github.com/gokaykucuk/uncomplicated) runs with its default
+quality gate plus `--fail-on major`, so any issue of major severity or above
+fails the build, not only issues in new code.
+
+Two deliberate exceptions, both visible in the repository:
+
+- `uncomplicated.toml` turns the cognitive-complexity rule off for
+  `*_test.go`. SonarQube applies that rule to main sources only.
+- `internal/execx/execx.go` and `internal/services/postgres.go` each carry
+  one `// NOSONAR` with its reason: the single place commands are executed,
+  and the mode of a mount point directory.
+
+GitHub Actions are pinned by commit SHA. Tool versions are pinned in
+`scripts/ci.sh` and the workflows.
