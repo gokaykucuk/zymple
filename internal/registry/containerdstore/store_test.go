@@ -90,8 +90,9 @@ func TestBlobRoundTrip(t *testing.T) {
 	if stat, err := blobs.Stat(ctx, dgst); err != nil || stat.Size != int64(len(data)) {
 		t.Fatalf("Stat = %+v, %v", stat, err)
 	}
-	if stat, err := reg.BlobStatter().Stat(ctx, dgst); err != nil || stat.Digest != dgst {
-		t.Fatalf("registry-wide Stat = %+v, %v", stat, err)
+	// Nothing can look a blob up without going through its repository.
+	if _, err := reg.BlobStatter().Stat(ctx, dgst); !errors.Is(err, distribution.ErrBlobUnknown) {
+		t.Fatalf("registry-wide Stat: %v", err)
 	}
 	if got, err := blobs.Get(ctx, dgst); err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("Get = %q, %v", got, err)
@@ -111,8 +112,10 @@ func TestBlobRoundTrip(t *testing.T) {
 	if _, err := blobs.Put(ctx, "text/plain", data); err != nil {
 		t.Fatalf("second Put: %v", err)
 	}
-	if n := leaseCount(t, stores); n != 1 {
-		t.Errorf("leases after one new blob and one duplicate = %d, want 1", n)
+	// The duplicate keeps its lease too: it holds the existing content until
+	// the manifest that needs it arrives.
+	if n := leaseCount(t, stores); n != 2 {
+		t.Errorf("leases after one new blob and one duplicate = %d, want 2", n)
 	}
 
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
@@ -331,4 +334,172 @@ func TestUnsupportedOperations(t *testing.T) {
 	if _, err := unmarshalManifest([]byte("not json")); err == nil {
 		t.Error("garbage was accepted as a manifest")
 	}
+}
+
+// otherRepo opens a second repository on the same stores.
+func otherRepo(t *testing.T, reg *Registry, name string) distribution.Repository {
+	t.Helper()
+	named, _ := reference.WithName(name)
+	repo, err := reg.Repository(ctx, named)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repo
+}
+
+func imageManifest(config, layer []byte) []byte {
+	return []byte(`{"schemaVersion":2,"mediaType":"` + v1.MediaTypeImageManifest + `","config":{"mediaType":"` +
+		v1.MediaTypeImageConfig + `","digest":"` + digest.FromBytes(config).String() + `","size":` + strconv.Itoa(len(config)) +
+		`},"layers":[{"mediaType":"` + v1.MediaTypeImageLayerGzip + `","digest":"` + digest.FromBytes(layer).String() +
+		`","size":` + strconv.Itoa(len(layer)) + `}]}`)
+}
+
+// Regression: the content store is shared, and a repository used to see every
+// blob in it. Knowing another app's digests was enough to build an image out
+// of its layers.
+func TestBlobsBelongToTheRepositoryThatPushedThem(t *testing.T) {
+	shop, reg, _ := newRepo(t)
+	other := otherRepo(t, reg, "zymple/other")
+	config, layer := []byte(`{"architecture":"amd64","os":"linux"}`), []byte("shop's private layer")
+	for _, blob := range [][]byte{config, layer} {
+		if _, err := shop.Blobs(ctx).Put(ctx, octetStream, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+	doc := imageManifest(config, layer)
+	parsed, err := unmarshalManifest(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shopManifests, _ := shop.Manifests(ctx)
+	manifestDigest, err := shopManifests.Put(ctx, parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blobs := other.Blobs(ctx)
+	manifests, _ := other.Manifests(ctx)
+	layerDigest := digest.FromBytes(layer)
+	if _, err := blobs.Stat(ctx, layerDigest); !errors.Is(err, distribution.ErrBlobUnknown) {
+		t.Errorf("another repository can stat the blob: %v", err)
+	}
+	if _, err := blobs.Get(ctx, layerDigest); !errors.Is(err, distribution.ErrBlobUnknown) {
+		t.Errorf("another repository can read the blob: %v", err)
+	}
+	if _, err := blobs.Open(ctx, layerDigest); !errors.Is(err, distribution.ErrBlobUnknown) {
+		t.Errorf("another repository can open the blob: %v", err)
+	}
+	if ok, _ := manifests.Exists(ctx, manifestDigest); ok {
+		t.Error("another repository can see the manifest")
+	}
+	if _, err := manifests.Get(ctx, manifestDigest); err == nil {
+		t.Error("another repository can read the manifest")
+	}
+	// Replaying the manifest, without having uploaded what it names.
+	if _, err := manifests.Put(ctx, parsed); err == nil {
+		t.Fatal("a manifest naming another repository's blobs was accepted")
+	}
+	// Its own config on top of the other repository's layer.
+	evil := []byte(`{"architecture":"amd64","os":"linux","config":{"Entrypoint":["cat","/secret"]}}`)
+	if _, err := blobs.Put(ctx, octetStream, evil); err != nil {
+		t.Fatal(err)
+	}
+	mixed, _ := unmarshalManifest(imageManifest(evil, layer))
+	if _, err := manifests.Put(ctx, mixed); err == nil {
+		t.Fatal("a manifest mixing in another repository's layer was accepted")
+	}
+	// Uploading the bytes is what makes a blob the repository's own.
+	for _, blob := range [][]byte{config, layer} {
+		if _, err := blobs.Put(ctx, octetStream, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := manifests.Put(ctx, parsed); err != nil {
+		t.Fatalf("a repository that uploaded every blob was refused: %v", err)
+	}
+	// And the first repository still owns them.
+	if _, err := shop.Blobs(ctx).Stat(ctx, layerDigest); err != nil {
+		t.Errorf("the first repository lost its blob: %v", err)
+	}
+}
+
+// Regression: a manifest lookup by digest used to read the whole blob into
+// memory, whatever its size.
+func TestGetRefusesLargeBlobs(t *testing.T) {
+	repo, _, _ := newRepo(t)
+	big := bytes.Repeat([]byte("x"), maxInlineBlob+1)
+	desc, err := repo.Blobs(ctx).Put(ctx, octetStream, big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Blobs(ctx).Get(ctx, desc.Digest); !errors.Is(err, distribution.ErrBlobUnknown) {
+		t.Errorf("Get of a blob over the limit: %v", err)
+	}
+	manifests, _ := repo.Manifests(ctx)
+	var unknown distribution.ErrManifestUnknownRevision
+	if _, err := manifests.Get(ctx, desc.Digest); !errors.As(err, &unknown) {
+		t.Errorf("a large layer was looked up as a manifest: %v", err)
+	}
+}
+
+// A rejected manifest gives its lease back; an accepted one keeps its content
+// held until the tag arrives.
+func TestManifestVerificationLeases(t *testing.T) {
+	repo, _, stores := newRepo(t)
+	config, layer := []byte(`{"os":"linux"}`), []byte("layer")
+	_, _ = repo.Blobs(ctx).Put(ctx, octetStream, config)
+	before := leaseCount(t, stores)
+	manifests, _ := repo.Manifests(ctx)
+	bad, _ := unmarshalManifest(imageManifest(config, layer))
+	if _, err := manifests.Put(ctx, bad); err == nil {
+		t.Fatal("a manifest with a missing layer was accepted")
+	}
+	if after := leaseCount(t, stores); after != before {
+		t.Errorf("a rejected manifest left %d leases behind", after-before)
+	}
+}
+
+func FuzzManifestPut(f *testing.F) {
+	config, layer := []byte(`{"os":"linux"}`), []byte("layer")
+	f.Add(imageManifest(config, layer))
+	f.Add([]byte(`{"schemaVersion":2,"manifests":[{"mediaType":"` + v1.MediaTypeImageManifest + `","digest":"` +
+		digest.FromBytes(layer).String() + `","size":5}]}`))
+	f.Add([]byte(`{"schemaVersion":1}`))
+	f.Add([]byte(`not json`))
+	dir := f.TempDir()
+	cs, err := local.NewStore(filepath.Join(dir, "content"))
+	if err != nil {
+		f.Fatal(err)
+	}
+	bdb, err := bolt.Open(filepath.Join(dir, "meta.db"), 0o600, nil)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Cleanup(func() { bdb.Close() })
+	stores := inProcess{db: metadata.NewDB(bdb, cs, nil)}
+	if err := stores.db.Init(ctx); err != nil {
+		f.Fatal(err)
+	}
+	reg := New(stores, "moby")
+	// "shop" owns two blobs. "other" owns nothing, so no manifest it sends
+	// may ever be stored.
+	shopName, _ := reference.WithName("zymple/shop")
+	shop, _ := reg.Repository(ctx, shopName)
+	for _, blob := range [][]byte{config, layer} {
+		if _, err := shop.Blobs(ctx).Put(ctx, octetStream, blob); err != nil {
+			f.Fatal(err)
+		}
+	}
+	otherName, _ := reference.WithName("zymple/other")
+	other, _ := reg.Repository(ctx, otherName)
+	manifests, _ := other.Manifests(ctx)
+	f.Fuzz(func(t *testing.T, doc []byte) {
+		parsed, err := unmarshalManifest(doc)
+		if err != nil {
+			return
+		}
+		if dgst, err := manifests.Put(ctx, parsed); err == nil {
+			t.Fatalf("a repository that owns no blobs stored manifest %s: %s", dgst, doc)
+		}
+	})
 }

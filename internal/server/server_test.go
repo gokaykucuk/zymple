@@ -694,6 +694,121 @@ func TestReload(t *testing.T) {
 	}
 }
 
+// Regression: a definition that failed validation used to drop the app from
+// the loaded set, and reload then treated it as removed: it stopped the
+// containers and deleted the proxy snippet of a running app over a typo.
+func TestReloadKeepsARunningAppWhoseDefinitionBroke(t *testing.T) {
+	f := newFixture(t, false)
+	f.deploy(t, digestA)
+	snippet := filepath.Join(f.Config.Caddy.SnippetsDir, "shop.caddy")
+	before, err := os.ReadFile(snippet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(f.appsDir, "shop", "app.yml"), "name: shop\nbogus_key: 1\n")
+	f.fake.Reset()
+	err = f.Reload(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "bogus_key") {
+		t.Fatalf("the broken definition was not reported: %v", err)
+	}
+	app, ok := f.App("shop")
+	if !ok || len(app.Domains) != 1 || app.Domains[0] != "shop.example.com" {
+		t.Fatalf("the running app lost its previous definition: %+v, %v", app, ok)
+	}
+	if call := f.fake.Find("docker stop"); call != "" {
+		t.Errorf("the running app was stopped: %s", call)
+	}
+	if call := f.fake.Find("docker rm"); call != "" {
+		t.Errorf("a container of the running app was removed: %s", call)
+	}
+	if after, err := os.ReadFile(snippet); err != nil || string(after) != string(before) {
+		t.Errorf("the proxy snippet changed: %q, %v", after, err)
+	}
+	if code, _, _ := call(f.network, "GET", "/api/v1/apps/shop/status", token, ""); code != 200 {
+		t.Errorf("the app's token stopped working: %d", code)
+	}
+	// Tokens are still re-read, so a revoked token is revoked at once.
+	writeFile(t, filepath.Join(f.appsDir, "shop", "tokens"), "")
+	_ = f.Reload(context.Background())
+	if code, _, _ := call(f.network, "GET", "/api/v1/apps/shop/status", token, ""); code != 401 {
+		t.Errorf("a removed token still works while the definition is broken: %d", code)
+	}
+	// Fixing the definition loads it, and removing the directory is still
+	// what stops an app.
+	writeApp(t, f.appsDir, "shop", "keep_releases: 7\n")
+	if err := f.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if app, _ := f.App("shop"); app.KeepReleases != 7 {
+		t.Errorf("the fixed definition was not loaded: %+v", app)
+	}
+	if err := os.RemoveAll(filepath.Join(f.appsDir, "shop")); err != nil {
+		t.Fatal(err)
+	}
+	f.fake.Reset()
+	if err := f.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.App("shop"); ok || f.fake.Find("docker stop shop-1") == "" {
+		t.Errorf("a removed app was not stopped: %v", f.fake.Calls())
+	}
+}
+
+func writeAppWithDomain(t *testing.T, appsDir, name, domain string) {
+	t.Helper()
+	writeApp(t, appsDir, name, "")
+	writeFile(t, filepath.Join(appsDir, name, "app.yml"),
+		fmt.Sprintf("name: %s\ndomains: [%s]\nweb: { service: web, port: 3000, drain: 0s }\n", name, domain))
+}
+
+// Regression: definitions load in name order and the first to claim a domain
+// wins, so a new app that sorts earlier used to unload, and thereby stop,
+// the running app that already served the domain.
+func TestReloadDoesNotLetANewAppTakeARunningAppsDomain(t *testing.T) {
+	f := newFixture(t, false)
+	f.deploy(t, digestA)
+	ctx := context.Background()
+	snippet := filepath.Join(f.Config.Caddy.SnippetsDir, "shop.caddy")
+
+	writeAppWithDomain(t, f.appsDir, "aaa", "shop.example.com")
+	f.fake.Reset()
+	err := f.Reload(ctx)
+	if err == nil || !strings.Contains(err.Error(), "app aaa") || !strings.Contains(err.Error(), "not loaded") {
+		t.Fatalf("the conflict was not reported: %v", err)
+	}
+	if _, ok := f.App("aaa"); ok {
+		t.Error("the newcomer was loaded with a domain that is in use")
+	}
+	if _, ok := f.App("shop"); !ok || f.fake.Find("docker stop") != "" {
+		t.Errorf("the running app was disturbed: %v", f.fake.Calls())
+	}
+	if _, err := os.Stat(snippet); err != nil {
+		t.Errorf("the running app's snippet is gone: %v", err)
+	}
+	if code, _, _ := call(f.network, "GET", "/api/v1/apps/aaa/status", "zym_aaa_token", ""); code != 401 {
+		t.Errorf("the rejected newcomer accepts its token: %d", code)
+	}
+
+	// The same when the app claiming the domain is itself already loaded:
+	// it goes back to its own previous definition.
+	writeAppWithDomain(t, f.appsDir, "aaa", "aaa.example.com")
+	if err := f.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	writeAppWithDomain(t, f.appsDir, "aaa", "shop.example.com")
+	err = f.Reload(ctx)
+	if err == nil || !strings.Contains(err.Error(), "keeping the previous definition") {
+		t.Fatalf("the conflict was not reported: %v", err)
+	}
+	aaa, ok := f.App("aaa")
+	if !ok || aaa.Domains[0] != "aaa.example.com" {
+		t.Errorf("aaa = %+v, %v; want its previous definition", aaa, ok)
+	}
+	if shop, ok := f.App("shop"); !ok || shop.Domains[0] != "shop.example.com" {
+		t.Errorf("shop = %+v, %v", shop, ok)
+	}
+}
+
 func TestReloadReportsReconcileFailures(t *testing.T) {
 	f := newFixture(t, false)
 	f.deploy(t, digestA)
@@ -852,6 +967,70 @@ func TestLineWriter(t *testing.T) {
 	events, _, _ := st.from(0)
 	if len(events) != 3 || events[0].Message != "one" || events[1].Message != "two" || events[2].Message != "three" {
 		t.Fatalf("events = %+v", events)
+	}
+}
+
+// Regression: output with no newline grew the line buffer without limit.
+func TestLineWriterBoundsALineWithNoEnd(t *testing.T) {
+	st := newStream()
+	w := st.writer("out")
+	chunk := bytes.Repeat([]byte("x"), 10<<10)
+	for i := 0; i < 20; i++ { // 200 KiB with no newline
+		if _, err := w.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		if len(w.buf) >= maxLine {
+			t.Fatalf("buffer holds %d bytes, limit %d", len(w.buf), maxLine)
+		}
+	}
+	fmt.Fprint(w, "\nshort\n")
+	w.flush()
+	events, _, _ := st.from(0)
+	total := 0
+	for _, e := range events[:len(events)-1] {
+		if len(e.Message) > maxLine {
+			t.Fatalf("an event carries %d bytes", len(e.Message))
+		}
+		total += len(e.Message)
+	}
+	if total != 200<<10 || events[len(events)-1].Message != "short" {
+		t.Errorf("%d events carrying %d bytes, last %q", len(events), total, events[len(events)-1].Message)
+	}
+	// A long line that does end is cut the same way, and nothing is lost.
+	st = newStream()
+	w = st.writer("out")
+	fmt.Fprint(w, strings.Repeat("y", maxLine+5)+"\n")
+	events, _, _ = st.from(0)
+	if len(events) != 2 || len(events[0].Message) != maxLine || events[1].Message != "yyyyy" {
+		t.Errorf("long line became %d events", len(events))
+	}
+}
+
+// Regression: events for a reader that had left were kept without limit.
+func TestStreamBoundsItsBacklog(t *testing.T) {
+	st := newStream()
+	for i := 0; i < maxBacklog+500; i++ {
+		st.add(deploy.Event{Step: "log", Message: fmt.Sprint(i)})
+	}
+	st.add(deploy.Event{Step: "done", Status: "ok"})
+	st.close()
+	st.mu.Lock()
+	held := len(st.events)
+	st.mu.Unlock()
+	if held != maxBacklog {
+		t.Fatalf("stream holds %d events, limit %d", held, maxBacklog)
+	}
+	// A reader that arrives late gets the newest events, ending with the
+	// outcome, and then the stream ends instead of repeating itself.
+	rec := httptest.NewRecorder()
+	st.serve(rec, httptest.NewRequest("GET", "/", nil))
+	lines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	if len(lines) != maxBacklog || !strings.Contains(lines[0], `"501"`) || !strings.Contains(lines[len(lines)-1], `"done"`) {
+		t.Fatalf("delivered %d lines, first %s, last %s", len(lines), lines[0], lines[len(lines)-1])
+	}
+	// Asking past the end is answered with nothing.
+	if events, next, _, _ := st.read(1 << 30); len(events) != 0 || next != maxBacklog+501 {
+		t.Errorf("read past the end = %d events, next %d", len(events), next)
 	}
 }
 

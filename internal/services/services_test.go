@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -57,6 +60,39 @@ func newPostgres(t *testing.T, backup string, fake *execxtest.Fake) *Postgres {
 	}
 }
 
+// capture records every command in full, including what was sent on stdin
+// and the environment given to the docker CLI.
+type capture struct {
+	mu    sync.Mutex
+	cmds  []execx.Cmd
+	stdin []string
+}
+
+func (c *capture) wrap(next func(execx.Cmd) (string, error)) func(execx.Cmd) (string, error) {
+	return func(cmd execx.Cmd) (string, error) {
+		in := ""
+		if cmd.Stdin != nil {
+			data, _ := io.ReadAll(cmd.Stdin)
+			in = string(data)
+		}
+		c.mu.Lock()
+		c.cmds = append(c.cmds, cmd)
+		c.stdin = append(c.stdin, in)
+		c.mu.Unlock()
+		if next == nil {
+			return "", nil
+		}
+		return next(cmd)
+	}
+}
+
+// sql returns everything sent to psql on stdin.
+func (c *capture) sql() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.stdin, "\n")
+}
+
 // dockerState answers `docker inspect` with a container state and hash.
 type dockerState struct {
 	state, hash string
@@ -94,7 +130,8 @@ func (s *dockerState) handler(extra func(execx.Cmd) (string, error, bool)) func(
 func TestPostgresEnsureLifecycle(t *testing.T) {
 	st := &dockerState{}
 	fake := &execxtest.Fake{}
-	fake.Handler = st.handler(nil)
+	rec := &capture{}
+	fake.Handler = rec.wrap(st.handler(nil))
 	p := newPostgres(t, "posix", fake)
 	app := testApp(t, "postgres: { version: 17, pitr_days: 9 }\n")
 
@@ -111,6 +148,7 @@ func TestPostgresEnsureLifecycle(t *testing.T) {
 		"ghcr.io/gokaykucuk/zymple-postgres:17 postgres", "archive_mode=on",
 		"archive_command=pgbackrest --stanza=shop archive-push %p", ":/var/lib/postgresql/data",
 		"pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro", ":/var/lib/pgbackrest",
+		"-e POSTGRES_USER=postgres", "-e POSTGRES_DB=app", "-e POSTGRES_PASSWORD -e",
 	} {
 		if !strings.Contains(run, want) {
 			t.Errorf("run command lacks %q:\n%s", want, run)
@@ -119,7 +157,7 @@ func TestPostgresEnsureLifecycle(t *testing.T) {
 	if strings.Contains(run, "-p ") || strings.Contains(run, "--publish") {
 		t.Error("postgres must not publish a port")
 	}
-	if fake.Find("pg_isready -h 127.0.0.1") == "" || fake.Find("ALTER ROLE app PASSWORD") == "" || fake.Find("stanza-create") == "" {
+	if fake.Find("pg_isready -h 127.0.0.1") == "" || !strings.Contains(rec.sql(), "ALTER ROLE app LOGIN PASSWORD") || fake.Find("stanza-create") == "" {
 		t.Errorf("post-start steps missing: %v", fake.Calls())
 	}
 	if fake.Find("--entrypoint chown") == "" {
@@ -129,14 +167,22 @@ func TestPostgresEnsureLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"repo1-type=posix", "repo1-retention-full=9", "repo1-cipher-pass=Secret", "[shop]", "pg1-path=/var/lib/postgresql/data/pgdata", "pg1-user=app"} {
+	for _, want := range []string{"repo1-type=posix", "repo1-retention-full=9", "repo1-cipher-pass=Secret", "[shop]", "pg1-path=/var/lib/postgresql/data/pgdata", "pg1-user=postgres"} {
 		if !strings.Contains(string(conf), want) {
 			t.Errorf("pgbackrest.conf lacks %q:\n%s", want, conf)
 		}
 	}
-	info, err := os.Stat(filepath.Join(p.dir("shop"), "password"))
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Errorf("password file: %v, %v", info, err)
+	for _, file := range []string{"password", "admin-password"} {
+		info, err := os.Stat(filepath.Join(p.dir("shop"), file))
+		if err != nil || info.Mode().Perm() != 0o600 {
+			t.Errorf("%s file: %v, %v", file, info, err)
+		}
+	}
+	// The app's role and the superuser must not share a password.
+	appPW, _ := p.password("shop")
+	adminPW, _ := p.adminPassword("shop")
+	if appPW == adminPW || strings.Contains(url, adminPW) {
+		t.Error("the app was given the superuser's password")
 	}
 
 	// A second Ensure with nothing changed must not touch the container:
@@ -160,12 +206,22 @@ func TestPostgresEnsureLifecycle(t *testing.T) {
 	if fake.Find("docker rm -f zymple-shop-postgres") == "" || fake.Find("docker run -d") == "" {
 		t.Errorf("a changed setting did not recreate the container: %v", fake.Calls())
 	}
+	// Regression: the running database used to be removed with `rm -f`
+	// alone, which is SIGKILL. It must be stopped gracefully first.
+	calls := strings.Join(fake.Calls(), "\n")
+	stop, rm := strings.Index(calls, "docker stop --time 120 zymple-shop-postgres"), strings.Index(calls, "docker rm -f zymple-shop-postgres")
+	if stop < 0 || stop > rm {
+		t.Errorf("the database was not stopped gracefully before removal:\n%s", calls)
+	}
 
 	// A stopped container is replaced as well.
 	st.state = "exited"
 	fake.Reset()
 	if _, err := p.Ensure(ctx, changed); err != nil || fake.Find("docker run -d") == "" {
 		t.Errorf("a stopped container was not replaced: %v, %v", err, fake.Calls())
+	}
+	if fake.Count("docker stop") != 0 {
+		t.Errorf("a container that is not running needs no stop: %v", fake.Calls())
 	}
 }
 
@@ -216,7 +272,7 @@ func TestPgbackrestConfS3(t *testing.T) {
 
 func TestPostgresEnsureFailures(t *testing.T) {
 	app := testApp(t, "postgres: { version: 17 }\n")
-	for _, failOn := range []string{"--entrypoint chown", "run -d", "psql", "stanza-create", "rm -f"} {
+	for _, failOn := range []string{"--entrypoint chown", "run -d", "psql", "stanza-create", "rm -f", "docker stop"} {
 		st := &dockerState{state: "running", hash: "stale"}
 		fake := &execxtest.Fake{}
 		fake.Handler = st.handler(func(c execx.Cmd) (string, error, bool) {
@@ -367,7 +423,8 @@ func TestRestoreOptionsValidate(t *testing.T) {
 func TestRestoreInPlace(t *testing.T) {
 	st := &dockerState{state: "running"}
 	fake := &execxtest.Fake{}
-	fake.Handler = st.handler(nil)
+	rec := &capture{}
+	fake.Handler = rec.wrap(st.handler(nil))
 	p := newPostgres(t, "posix", fake)
 	app := testApp(t, "postgres: { version: 17 }\n")
 	var out bytes.Buffer
@@ -384,7 +441,7 @@ func TestRestoreInPlace(t *testing.T) {
 		t.Fatalf("no call containing %q in %v", sub, calls)
 		return -1
 	}
-	check, stop, restore, start := index("--stanza=shop check"), index("docker stop zymple-shop-postgres"), index("--entrypoint sh"), index("docker start zymple-shop-postgres")
+	check, stop, restore, start := index("--stanza=shop check"), index("docker stop --time 120 zymple-shop-postgres"), index("--entrypoint sh"), index("docker start zymple-shop-postgres")
 	if !(check < stop && stop < restore && restore < start) {
 		t.Errorf("wrong order: check=%d stop=%d restore=%d start=%d", check, stop, restore, start)
 	}
@@ -397,7 +454,7 @@ func TestRestoreInPlace(t *testing.T) {
 	if strings.Contains(cmd, "--archive-mode=off") {
 		t.Error("an in-place restore must keep archiving")
 	}
-	if fake.Find("ALTER ROLE") == "" {
+	if !strings.Contains(rec.sql(), "ALTER ROLE app LOGIN PASSWORD") {
 		t.Error("the role password was not re-applied after the restore")
 	}
 }
@@ -467,7 +524,7 @@ func TestRestoreIntoDrill(t *testing.T) {
 func TestRestoreFailures(t *testing.T) {
 	app := testApp(t, "postgres: { version: 17 }\n")
 	var out bytes.Buffer
-	for _, failOn := range []string{"docker stop", "--entrypoint sh", "docker start", "ALTER ROLE"} {
+	for _, failOn := range []string{"docker stop", "--entrypoint sh", "docker start", "psql"} {
 		st := &dockerState{state: "running"}
 		fake := &execxtest.Fake{}
 		fake.Handler = st.handler(func(c execx.Cmd) (string, error, bool) {
@@ -526,13 +583,14 @@ func TestRedisEnsure(t *testing.T) {
 	fake := &execxtest.Fake{}
 	fake.Handler = st.handler(nil)
 	r := &Redis{Runner: fake, Config: testConfig(t, "")}
+	image := r.Config.RedisImage
 	cache := testApp(t, "redis: { persistent: false }\n")
 	url, err := r.Ensure(ctx, cache)
 	if err != nil || url != RedisURL {
 		t.Fatalf("Ensure = %q, %v", url, err)
 	}
 	run := fake.Find("docker run -d")
-	for _, want := range []string{"--name zymple-shop-redis", "--network-alias redis", "no-new-privileges:true", "redis:7-alpine redis-server --save  --appendonly no"} {
+	for _, want := range []string{"--name zymple-shop-redis", "--network-alias redis", "no-new-privileges:true", image + " redis-server --save  --appendonly no"} {
 		if !strings.Contains(run, want) {
 			t.Errorf("run command lacks %q:\n%s", want, run)
 		}
@@ -554,6 +612,10 @@ func TestRedisEnsure(t *testing.T) {
 	}
 	if fake.Find("docker rm -f zymple-shop-redis") == "" {
 		t.Error("changing the mode did not recreate the container")
+	}
+	calls := strings.Join(fake.Calls(), "\n")
+	if stop, rm := strings.Index(calls, "docker stop --time 60 zymple-shop-redis"), strings.Index(calls, "docker rm -f"); stop < 0 || stop > rm {
+		t.Errorf("Redis was not stopped gracefully before removal:\n%s", calls)
 	}
 	fake.Handler = func(c execx.Cmd) (string, error) {
 		if c.Args[0] == "inspect" {
@@ -586,7 +648,7 @@ func TestRedisBackupAndRestore(t *testing.T) {
 		t.Error("an existing repository was initialised again")
 	}
 	backup := fake.Find("backup /data")
-	for _, want := range []string{"/redis:/data:ro", "RESTIC_REPOSITORY=/repo", "restic/restic:0.17.3"} {
+	for _, want := range []string{"/redis:/data:ro", "RESTIC_REPOSITORY=/repo", r.Config.ResticImage + " backup /data"} {
 		if !strings.Contains(backup, want) {
 			t.Errorf("backup command lacks %q:\n%s", want, backup)
 		}
@@ -613,7 +675,7 @@ func TestRedisBackupAndRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := strings.Join(fake.Calls(), "\n")
-	stop, restore, start := strings.Index(calls, "docker stop zymple-shop-redis"), strings.Index(calls, "restore latest"), strings.Index(calls, "docker start zymple-shop-redis")
+	stop, restore, start := strings.Index(calls, "docker stop --time 60 zymple-shop-redis"), strings.Index(calls, "restore latest"), strings.Index(calls, "docker start zymple-shop-redis")
 	if stop < 0 || !(stop < restore && restore < start) {
 		t.Errorf("restore order wrong:\n%s", calls)
 	}
@@ -636,7 +698,7 @@ func TestRedisBackupAndRestore(t *testing.T) {
 	if err := s3.Backup(ctx, persistent, &out); err != nil {
 		t.Fatal(err)
 	}
-	if cmd := fake.Find("backup /data"); !strings.Contains(cmd, "RESTIC_REPOSITORY=s3:https://s3.example.com/bkt/prod/shop/redis") || !strings.Contains(cmd, "AWS_ACCESS_KEY_ID=AK") {
+	if cmd := fake.Find("backup /data"); !strings.Contains(cmd, "RESTIC_REPOSITORY=s3:https://s3.example.com/bkt/prod/shop/redis") || !strings.Contains(cmd, "-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY ") {
 		t.Errorf("s3 backup command: %s", cmd)
 	}
 
@@ -653,4 +715,245 @@ func TestRedisBackupAndRestore(t *testing.T) {
 	if err := (&Redis{Runner: fake, Config: plain}).Backup(ctx, persistent, &out); err == nil {
 		t.Error("a backup without a passphrase should fail")
 	}
+}
+
+// Regression: restic refuses "restore --target / --delete" without a filter,
+// so the restore could never succeed, and the Redis it had stopped stayed
+// down.
+func TestRedisRestoreCommandAndRestart(t *testing.T) {
+	persistent := testApp(t, "redis: { persistent: true }\n")
+	fake := &execxtest.Fake{}
+	r := &Redis{Runner: fake, Config: testConfig(t, "posix")}
+	var out bytes.Buffer
+	if err := r.Restore(ctx, persistent, &out); err != nil {
+		t.Fatal(err)
+	}
+	if cmd := fake.Find("restore latest"); !strings.HasSuffix(cmd, " restore latest --target / --delete --include /data") {
+		t.Errorf("restore command: %s", cmd)
+	}
+
+	fake.Reset()
+	fake.Handler = func(c execx.Cmd) (string, error) {
+		if strings.Contains(c.String(), "restore latest") {
+			return "", errors.New("restic says no")
+		}
+		return "", nil
+	}
+	err := r.Restore(ctx, persistent, &out)
+	if err == nil || !strings.Contains(err.Error(), "restic says no") {
+		t.Fatalf("a failed restore was not reported: %v", err)
+	}
+	if fake.Find("docker start zymple-shop-redis") == "" {
+		t.Errorf("Redis was left stopped after a failed restore: %v", fake.Calls())
+	}
+
+	// Both failures are reported when the restart fails too.
+	fake.Handler = func(c execx.Cmd) (string, error) {
+		if strings.Contains(c.String(), "restore latest") || strings.Contains(c.String(), "docker start") {
+			return "", errors.New("failed: " + c.Args[0])
+		}
+		return "", nil
+	}
+	if err := r.Restore(ctx, persistent, &out); err == nil || !strings.Contains(err.Error(), "failed: run") || !strings.Contains(err.Error(), "failed: start") {
+		t.Errorf("want both errors, got: %v", err)
+	}
+}
+
+// Regression: the Postgres password, the backup passphrase and the S3 secret
+// key were passed as `-e NAME=value` and inside a psql -c argument. Every
+// local user can read a process's command line.
+func TestNoSecretOnACommandLine(t *testing.T) {
+	for _, backup := range []string{"posix", "s3"} {
+		st := &dockerState{}
+		fake := &execxtest.Fake{}
+		rec := &capture{}
+		fake.Handler = rec.wrap(st.handler(nil))
+		p := newPostgres(t, backup, fake)
+		r := &Redis{Runner: fake, Config: p.Config}
+		app := testApp(t, "postgres: { version: 17 }\nredis: { persistent: true }\n")
+		var out bytes.Buffer
+		steps := map[string]func() error{
+			"postgres ensure":  func() error { _, err := p.Ensure(ctx, app); return err },
+			"postgres backup":  func() error { return p.Backup(ctx, "shop", "full", &out) },
+			"postgres restore": func() error { return p.Restore(ctx, app, RestoreOptions{}, &out) },
+			"postgres drill":   func() error { return p.Restore(ctx, app, RestoreOptions{Into: "d"}, &out) },
+			"redis ensure":     func() error { _, err := r.Ensure(ctx, app); return err },
+			"redis backup":     func() error { return r.Backup(ctx, app, &out) },
+			"redis restore":    func() error { return r.Restore(ctx, app, &out) },
+		}
+		for name, step := range steps {
+			if err := step(); err != nil {
+				t.Fatalf("%s/%s: %v", backup, name, err)
+			}
+		}
+		appPW, _ := p.password("shop")
+		adminPW, _ := p.adminPassword("shop")
+		secrets := map[string]string{"app password": appPW, "superuser password": adminPW, "cipher pass": "Secret"}
+		if backup == "s3" {
+			secrets["s3 secret key"] = "SK"
+			secrets["s3 access key"] = "AK"
+		}
+		word := func(secret string) *regexp.Regexp {
+			return regexp.MustCompile(`(^|[^A-Za-z0-9])` + regexp.QuoteMeta(secret) + `($|[^A-Za-z0-9])`)
+		}
+		for what, secret := range secrets {
+			re := word(secret)
+			for _, cmd := range rec.cmds {
+				for _, arg := range cmd.Args {
+					if re.MatchString(arg) {
+						t.Errorf("%s: the %s is on a command line: %s", backup, what, cmd.String())
+					}
+				}
+			}
+		}
+		// They still have to arrive: through the docker CLI's environment or
+		// psql's stdin.
+		env := ""
+		for _, cmd := range rec.cmds {
+			env += strings.Join(cmd.Env, "\n") + "\n"
+		}
+		for _, want := range []string{"POSTGRES_PASSWORD=" + adminPW, "RESTIC_PASSWORD=Secret"} {
+			if !strings.Contains(env, want+"\n") {
+				t.Errorf("%s: %s was not passed in the environment", backup, strings.SplitN(want, "=", 2)[0])
+			}
+		}
+		if backup == "s3" && (!strings.Contains(env, "AWS_SECRET_ACCESS_KEY=SK\n") || !strings.Contains(env, "AWS_ACCESS_KEY_ID=AK\n")) {
+			t.Error("the S3 credentials were not passed in the environment")
+		}
+		if !strings.Contains(rec.sql(), "PASSWORD '"+appPW+"'") {
+			t.Errorf("%s: the role password did not reach psql on stdin", backup)
+		}
+	}
+}
+
+// Regression: the app's role was the cluster's superuser, so the app could
+// run programs in the database container and read the backup credentials.
+func TestAppRoleIsNotTheSuperuser(t *testing.T) {
+	st := &dockerState{}
+	fake := &execxtest.Fake{}
+	rec := &capture{}
+	fake.Handler = rec.wrap(st.handler(func(c execx.Cmd) (string, error, bool) {
+		if strings.Contains(c.String(), "psql -U postgres") {
+			return "f\n", nil, true
+		}
+		return "", nil, false
+	}))
+	p := newPostgres(t, "", fake)
+	var warnings []string
+	p.Warn = func(msg string) { warnings = append(warnings, msg) }
+	if _, err := p.Ensure(ctx, testApp(t, "postgres: { version: 17 }\n")); err != nil {
+		t.Fatal(err)
+	}
+	if fake.Count("psql -U app") != 0 {
+		t.Errorf("a new cluster was managed through the app's role: %v", fake.Calls())
+	}
+	sql := rec.sql()
+	for _, want := range []string{"CREATE ROLE app LOGIN;", "ALTER DATABASE app OWNER TO app;", "SELECT rolsuper FROM pg_roles WHERE rolname = 'app';"} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("role setup lacks %q:\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "CREATE ROLE postgres") {
+		t.Error("a new cluster already has its superuser")
+	}
+	if len(warnings) != 0 {
+		t.Errorf("unexpected warnings: %v", warnings)
+	}
+}
+
+// A cluster created before the roles were split has "app" as its only
+// superuser. It must keep working, gain the postgres role, and be reported.
+func TestLegacyClusterGainsASuperuserAndWarns(t *testing.T) {
+	st := &dockerState{}
+	fake := &execxtest.Fake{}
+	rec := &capture{}
+	hasPostgres := false
+	fake.Handler = rec.wrap(st.handler(func(c execx.Cmd) (string, error, bool) {
+		line := c.String()
+		switch {
+		case strings.Contains(line, "psql -U postgres") && !hasPostgres:
+			return "", errors.New(`role "postgres" does not exist`), true
+		case strings.Contains(line, "psql -U app"):
+			hasPostgres = true
+			return "", nil, true
+		case strings.Contains(line, "psql -U postgres"):
+			return "t\n", nil, true
+		}
+		return "", nil, false
+	}))
+	p := newPostgres(t, "", fake)
+	var warnings []string
+	p.Warn = func(msg string) { warnings = append(warnings, msg) }
+	app := testApp(t, "postgres: { version: 17 }\n")
+	if _, err := p.Ensure(ctx, app); err != nil {
+		t.Fatal(err)
+	}
+	sql := rec.sql()
+	if !strings.Contains(sql, "CREATE ROLE postgres SUPERUSER LOGIN") || !strings.Contains(sql, "ALTER ROLE app LOGIN PASSWORD") {
+		t.Errorf("legacy migration SQL:\n%s", sql)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "superuser") || !strings.Contains(warnings[0], "shop") {
+		t.Errorf("warnings = %v", warnings)
+	}
+	// Without a Warn function the condition is simply not reported.
+	p.Warn = nil
+	st.state = "exited"
+	if _, err := p.Ensure(ctx, app); err != nil {
+		t.Fatal(err)
+	}
+
+	// A cluster with neither role usable is an error that names both tries.
+	broken := &execxtest.Fake{}
+	bst := &dockerState{}
+	broken.Handler = bst.handler(func(c execx.Cmd) (string, error, bool) {
+		if strings.Contains(c.String(), "psql") {
+			return "", errors.New("refused for " + c.Args[5]), true
+		}
+		return "", nil, false
+	})
+	_, err := newPostgres(t, "", broken).Ensure(ctx, app)
+	if err == nil || !strings.Contains(err.Error(), "refused for postgres") || !strings.Contains(err.Error(), "refused for app") {
+		t.Errorf("want both attempts in the error, got: %v", err)
+	}
+}
+
+func FuzzRestoreOptions(f *testing.F) {
+	f.Add("2026-01-02 15:04:05+00", "drill")
+	f.Add("2026-01-02T15:04:05Z", "")
+	f.Add("", "a")
+	f.Add("2026-01-02 15:04:05' --pg1-path=/", "../x")
+	f.Add("2026-01-02 15:04:05\n--delta", "-rm")
+	nameRe := regexp.MustCompile(`^[a-z0-9-]+$`)
+	fixed := map[string]bool{
+		"--stanza=shop": true, "--type=time": true, "--target-action=promote": true,
+		"--archive-mode=off": true, "--delta": true, "restore": true,
+	}
+	f.Fuzz(func(t *testing.T, at, into string) {
+		opts := RestoreOptions{Time: at, Into: into}
+		if opts.Validate() != nil {
+			return
+		}
+		for _, arg := range opts.backrestArgs("shop") {
+			if fixed[arg] {
+				continue
+			}
+			// The only argument built from input is the recovery target.
+			value, ok := strings.CutPrefix(arg, "--target=")
+			if !ok || value != at || !targetTimeRe.MatchString(value) {
+				t.Fatalf("unexpected pgbackrest argument %q from %+v", arg, opts)
+			}
+			if strings.ContainsAny(value, "\n\r\t'\"\\$`;") || strings.HasPrefix(value, "-") || strings.HasPrefix(value, " ") {
+				t.Fatalf("recovery target %q is not a plain timestamp", value)
+			}
+		}
+		if into == "" {
+			return
+		}
+		if strings.HasPrefix(into, "-") || strings.ContainsAny(into, "/.") {
+			t.Fatalf("drill name %q could act as a flag or a path", into)
+		}
+		if name := DrillContainer("shop", into); !nameRe.MatchString(name) {
+			t.Fatalf("drill container name %q", name)
+		}
+	})
 }

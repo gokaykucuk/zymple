@@ -10,7 +10,11 @@ ExecStart=/usr/local/bin/zymple server --config /etc/zymple/zymple.yml
 ExecReload=/usr/local/bin/zymple reload
 Restart=always
 RestartSec=2
-# A deploy in flight is allowed to finish before the daemon stops.
+# A deploy in flight is allowed to finish before the daemon stops. "mixed"
+# sends the stop signal to the daemon only: with the default, systemd would
+# also signal the docker commands it is waiting on and kill a migration
+# half way through.
+KillMode=mixed
 TimeoutStopSec=600
 RuntimeDirectory=zymple
 RuntimeDirectoryMode=0750

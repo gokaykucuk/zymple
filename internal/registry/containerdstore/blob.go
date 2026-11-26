@@ -8,36 +8,108 @@ import (
 	"strconv"
 
 	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/errdefs"
 	"github.com/distribution/distribution/v3"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-const octetStream = "application/octet-stream"
+const (
+	octetStream = "application/octet-stream"
+	// ownerLabelPrefix starts the content label that records which
+	// repositories a blob was pushed to.
+	ownerLabelPrefix = "zymple.io/pushed-to."
+	// maxInlineBlob bounds what Get reads into memory. It matches the size
+	// the registry accepts for a manifest.
+	maxInlineBlob = 4 << 20
+)
 
 // blobStore implements distribution.BlobStore on the containerd content
-// store. The content store is not divided by repository.
+// store for one repository.
+//
+// The content store itself is shared by every repository and by Docker, so
+// the store keeps its own record of ownership: a blob is labelled with each
+// repository that uploaded its bytes, and a repository sees only blobs that
+// carry its label. Without that, knowing a digest would be enough to build
+// an image out of another app's layers.
 type blobStore struct {
-	reg *Registry
+	reg  *Registry
+	repo string
+}
+
+func ownerLabel(repo string) string { return ownerLabelPrefix + repo }
+
+// info describes a blob this repository owns. A blob that exists but was
+// never pushed to the repository is reported as unknown.
+func (b *blobStore) info(ctx context.Context, dgst digest.Digest) (content.Info, error) {
+	info, err := b.reg.stores.ContentStore().Info(b.reg.ctx(ctx), dgst)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return content.Info{}, distribution.ErrBlobUnknown
+		}
+		return content.Info{}, fmt.Errorf("stat blob %s: %w", dgst, err)
+	}
+	if info.Labels[ownerLabel(b.repo)] == "" {
+		return content.Info{}, distribution.ErrBlobUnknown
+	}
+	return info, nil
+}
+
+// claim records that the repository uploaded the blob's bytes.
+func (b *blobStore) claim(ctx context.Context, dgst digest.Digest) error {
+	key := ownerLabel(b.repo)
+	info := content.Info{Digest: dgst, Labels: map[string]string{key: "1"}}
+	if _, err := b.reg.stores.ContentStore().Update(b.reg.ctx(ctx), info, "labels."+key); err != nil {
+		return fmt.Errorf("record owner of blob %s: %w", dgst, err)
+	}
+	return nil
 }
 
 var _ distribution.BlobStore = (*blobStore)(nil)
 
+// hold puts the given content under a lease that expires on its own. The
+// returned function gives the lease up early.
+func (b *blobStore) hold(ctx context.Context, refs []v1.Descriptor) (release func(), err error) {
+	ctx = b.reg.ctx(ctx)
+	manager := b.reg.stores.LeasesService()
+	lease, err := manager.Create(ctx, leases.WithRandomID(), leases.WithExpiration(leaseExpiration))
+	if err != nil {
+		return nil, fmt.Errorf("create containerd lease: %w", err)
+	}
+	release = func() { _ = manager.Delete(context.WithoutCancel(ctx), lease) }
+	for _, ref := range refs {
+		if ref.Digest.Validate() != nil {
+			continue
+		}
+		if err := manager.AddResource(ctx, lease, leases.Resource{ID: ref.Digest.String(), Type: "content"}); err != nil {
+			release()
+			return nil, fmt.Errorf("lease blob %s: %w", ref.Digest, err)
+		}
+	}
+	return release, nil
+}
+
 // Stat describes a blob, or returns distribution.ErrBlobUnknown.
 func (b *blobStore) Stat(ctx context.Context, dgst digest.Digest) (v1.Descriptor, error) {
-	info, err := b.reg.stores.ContentStore().Info(b.reg.ctx(ctx), dgst)
+	info, err := b.info(ctx, dgst)
 	if err != nil {
-		if errdefs.IsNotFound(err) {
-			return v1.Descriptor{}, distribution.ErrBlobUnknown
-		}
-		return v1.Descriptor{}, fmt.Errorf("stat blob %s: %w", dgst, err)
+		return v1.Descriptor{}, err
 	}
 	return v1.Descriptor{MediaType: octetStream, Digest: info.Digest, Size: info.Size}, nil
 }
 
-// Get returns a blob's content. It is meant for small blobs such as manifests.
+// Get returns a blob's content. It is meant for small blobs such as
+// manifests: anything larger is reported as unknown instead of being read
+// into memory.
 func (b *blobStore) Get(ctx context.Context, dgst digest.Digest) ([]byte, error) {
+	info, err := b.info(ctx, dgst)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size > maxInlineBlob {
+		return nil, distribution.ErrBlobUnknown
+	}
 	data, err := content.ReadBlob(b.reg.ctx(ctx), b.reg.stores.ContentStore(), v1.Descriptor{Digest: dgst})
 	if err != nil {
 		if errdefs.IsNotFound(err) {
@@ -50,6 +122,9 @@ func (b *blobStore) Get(ctx context.Context, dgst digest.Digest) ([]byte, error)
 
 // Open returns a reader over a blob.
 func (b *blobStore) Open(ctx context.Context, dgst digest.Digest) (io.ReadSeekCloser, error) {
+	if _, err := b.info(ctx, dgst); err != nil {
+		return nil, err
+	}
 	ra, err := b.reg.stores.ContentStore().ReaderAt(b.reg.ctx(ctx), v1.Descriptor{Digest: dgst})
 	if err != nil {
 		if errdefs.IsNotFound(err) {
@@ -62,7 +137,7 @@ func (b *blobStore) Open(ctx context.Context, dgst digest.Digest) (io.ReadSeekCl
 
 // Put stores a small blob, such as a manifest, in one call.
 func (b *blobStore) Put(ctx context.Context, mediaType string, blob []byte) (desc v1.Descriptor, err error) {
-	writer, err := newBlobWriter(ctx, b.reg, "")
+	writer, err := newBlobWriter(ctx, b, "")
 	if err != nil {
 		return v1.Descriptor{}, err
 	}
@@ -80,12 +155,12 @@ func (b *blobStore) Put(ctx context.Context, mediaType string, blob []byte) (des
 
 // Create starts a blob upload.
 func (b *blobStore) Create(ctx context.Context, _ ...distribution.BlobCreateOption) (distribution.BlobWriter, error) {
-	return newBlobWriter(ctx, b.reg, "")
+	return newBlobWriter(ctx, b, "")
 }
 
 // Resume continues the upload with the given id.
 func (b *blobStore) Resume(ctx context.Context, id string) (distribution.BlobWriter, error) {
-	return newBlobWriter(ctx, b.reg, id)
+	return newBlobWriter(ctx, b, id)
 }
 
 // ServeBlob writes a blob to an HTTP response.

@@ -33,8 +33,8 @@ type world struct {
 	content  map[string]bool // digests whose content survives without a name
 	webs     map[int]bool    // release -> running
 	compose  map[int]bool
-	tags     map[string]bool
-	port     int // where the proxy points
+	tags     map[string]string // tag -> digest
+	port     int               // where the proxy points
 	hook     map[string]func()
 	nextPort int
 	released []int
@@ -44,7 +44,7 @@ type world struct {
 func newWorld() *world {
 	return &world{
 		fail: map[string]error{}, images: map[string]bool{digestA: true, digestB: true, digestC: true},
-		content: map[string]bool{}, webs: map[int]bool{}, compose: map[int]bool{}, tags: map[string]bool{},
+		content: map[string]bool{}, webs: map[int]bool{}, compose: map[int]bool{}, tags: map[string]string{},
 		hook: map[string]func(){}, nextPort: 20000,
 	}
 }
@@ -217,27 +217,46 @@ func (w *world) UpServices(_ context.Context, _ *appdef.App, release int, _ io.W
 	return w.op("UpServices", release)
 }
 
-func (w *world) Pin(_ context.Context, _ string, _ string, release int) error {
+func (w *world) Pin(_ context.Context, _ string, digest string, release int) error {
 	if err := w.op("Pin", release); err != nil {
 		return err
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.tags[runtime.ReleaseTag(release)] = true
+	w.tags[runtime.ReleaseTag(release)] = digest
 	return nil
 }
 
-func (w *world) Tags(context.Context, string) ([]string, error) {
+func (w *world) Tags(context.Context, string) ([]runtime.Tag, error) {
 	if err := w.op("Tags"); err != nil {
 		return nil, err
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	var tags []string
-	for tag := range w.tags {
-		tags = append(tags, tag)
+	var tags []runtime.Tag
+	for tag, digest := range w.tags {
+		tags = append(tags, runtime.Tag{Name: tag, Digest: digest})
 	}
 	return tags, nil
+}
+
+func (w *world) hasTag(tag string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, ok := w.tags[tag]
+	return ok
+}
+
+// indexOf returns the position of the first log entry equal to entry, or -1.
+func (w *world) indexOf(entry string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i, l := range w.log {
+		if l == entry {
+			return i
+		}
+	}
+	return -1
 }
 
 func (w *world) RemoveTag(_ context.Context, _ string, tag string) error {

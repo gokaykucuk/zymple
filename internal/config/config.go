@@ -19,6 +19,14 @@ import (
 // DefaultPath is where the server looks for its configuration.
 const DefaultPath = "/etc/zymple/zymple.yml"
 
+// Default images for the managed services. They are pinned by digest: these
+// containers see app data and backup credentials, and a tag can be moved.
+// Bump the version and the digest together.
+const (
+	DefaultRedisImage  = "redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe"
+	DefaultResticImage = "restic/restic:0.17.3@sha256:8f5a62b422a2cb1277ea0dd6e826fe1acf649e5b9f02d60e5268d5fd1976255a"
+)
+
 // Caddy configures the reverse proxy integration.
 type Caddy struct {
 	SnippetsDir string   `yaml:"snippets_dir"`
@@ -88,8 +96,8 @@ func Default() Config {
 		Caddy:       Caddy{SnippetsDir: "/etc/caddy/zymple", Reload: []string{"systemctl", "reload", "caddy"}, TLS: proxy.TLSAuto},
 		Containerd:  Containerd{Socket: "/run/containerd/containerd.sock", Namespace: "moby"},
 		Ports:       Ports{Low: 20000, High: 29999},
-		RedisImage:  "redis:7-alpine",
-		ResticImage: "restic/restic:0.17.3",
+		RedisImage:  DefaultRedisImage,
+		ResticImage: DefaultResticImage,
 	}
 }
 

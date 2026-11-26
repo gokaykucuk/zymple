@@ -139,6 +139,11 @@ func TestContainersParsing(t *testing.T) {
 	if !strings.Contains(call, "label=zymple.app=shop") || !strings.Contains(call, "label=zymple.role=web") {
 		t.Errorf("filters missing: %s", call)
 	}
+	// Regression: `compose run` containers carry the service's labels and
+	// were taken for the web container.
+	if !strings.Contains(call, "label=com.docker.compose.oneoff=False") {
+		t.Errorf("one-off containers are not filtered out: %s", call)
+	}
 	fake.Handler = func(execx.Cmd) (string, error) { return "", errors.New("daemon down") }
 	if _, err := d.Containers(context.Background(), "shop", appdef.RoleWeb); err == nil {
 		t.Error("want an error")
@@ -233,8 +238,19 @@ func TestStopAllAndStartAll(t *testing.T) {
 	if err := d.StopAll(context.Background(), "shop"); err != nil || fake.Find("docker stop svc web") == "" {
 		t.Fatalf("StopAll: %v, %v", err, fake.Calls())
 	}
+	// A one-off command still running is stopped with the app...
+	for _, call := range fake.Calls() {
+		if strings.HasPrefix(call, "docker ps") && strings.Contains(call, "oneoff") {
+			t.Errorf("StopAll skipped one-off containers: %s", call)
+		}
+	}
+	fake.Reset()
 	if err := d.StartAll(context.Background(), "shop"); err != nil || fake.Find("docker start svc web") == "" {
 		t.Fatalf("StartAll: %v, %v", err, fake.Calls())
+	}
+	// ...but never started a second time.
+	if n := fake.Count("label=com.docker.compose.oneoff=False"); n != 2 {
+		t.Errorf("StartAll must leave one-off containers alone: %v", fake.Calls())
 	}
 	fake.Reset()
 	fake.Handler = psHandler()
@@ -248,12 +264,23 @@ func TestStopAllAndStartAll(t *testing.T) {
 }
 
 func TestTags(t *testing.T) {
-	fake := &execxtest.Fake{Handler: func(execx.Cmd) (string, error) { return "release-1\n<none>\npush-abc\n", nil }}
+	fake := &execxtest.Fake{Handler: func(execx.Cmd) (string, error) {
+		return "release-1 " + digest + "\n<none> " + digest + "\n\npush-abc <none>\npush-def\n", nil
+	}}
 	d := &Docker{Runner: fake}
 	ctx := context.Background()
 	tags, err := d.Tags(ctx, "shop")
-	if err != nil || len(tags) != 2 || tags[0] != "release-1" || tags[1] != "push-abc" {
+	want := []Tag{{Name: "release-1", Digest: digest}, {Name: "push-abc"}, {Name: "push-def"}}
+	if err != nil || len(tags) != len(want) {
 		t.Fatalf("Tags = %v, %v", tags, err)
+	}
+	for i := range want {
+		if tags[i] != want[i] {
+			t.Errorf("tag %d = %+v, want %+v", i, tags[i], want[i])
+		}
+	}
+	if call := fake.Calls()[0]; call != "docker images --digests --format {{.Tag}} {{.Digest}} zymple/shop" {
+		t.Errorf("listed tags with %q", call)
 	}
 	fake.Handler = nil
 	if err := d.Pin(ctx, "shop", digest, 7); err != nil || fake.Find("docker tag zymple/shop@"+digest+" zymple/shop:release-7") == "" {

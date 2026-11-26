@@ -51,6 +51,12 @@ Set `ZYMPLE_E2E_KEEP=1` to leave the host running for inspection.
   it converges back in the first case and forward in the second, with no
   failed requests.
 - Two operations on one app at once: exactly one runs.
+- Unit: convergence points the proxy at the running current release before
+  it removes any other web container, and removes nothing if that fails.
+- Unit: a reload with a typo in a running app's definition, or with a new app
+  claiming its domain, leaves the app loaded, proxied and running.
+- Unit: cleanup leaves a freshly pushed tag it cannot account for alone for
+  an hour, and removes a deploy's own push tag at once.
 
 ### Zero downtime
 
@@ -81,14 +87,19 @@ back from the image store and check the garbage-collection labels that keep
 its layers alive. They also cover what must be refused: content that does not
 match its digest, a manifest that is malformed or references blobs that were
 never uploaded, reads, deletes, other repositories and cross-repository
-mounts.
+mounts. One app replaying another app's manifest, or putting its own config
+on another app's layers, is refused until it has uploaded every blob itself,
+and a lookup of a layer as a manifest is answered without reading it.
+Fuzzing asserts that a repository which owns no blobs can never store a
+manifest.
 
 ### Compose validation
 
-A corpus of 61 escape attempts that must all be rejected: privileged mode,
+A corpus of 90 escape attempts that must all be rejected: privileged mode,
 host namespaces, capabilities, devices, the Docker socket, host bind mounts
 in every syntax, volume driver options, `build:`, published ports, other
-images, interpolation, root users, YAML anchors and merge keys, `extends`,
+images, interpolation, root users in every spelling Docker resolves to uid 0,
+service names that collide with Zymple's own, YAML anchors and merge keys, `extends`,
 `include`, and more. Fuzzing asserts that whatever the validator accepts
 renders to a file containing only allow-listed keys. New bypass ideas go into
 the corpus first.
@@ -109,6 +120,19 @@ recorded time, the cluster is restored to that time, and exactly the earlier
 rows exist. This runs twice: into a drill cluster while the live one keeps
 serving, and in place. Afterwards the restored cluster accepts writes, takes
 a backup and survives a deploy.
+
+### Managed services
+
+- Unit: no secret appears in the arguments of any command, for Postgres and
+  Redis, S3 and directory repositories.
+- Unit: role setup on a new cluster and on one whose superuser is still
+  `app`; a failed Redis restore starts Redis again; database containers are
+  stopped gracefully before they are replaced.
+- Fuzzing asserts that accepted restore options only ever produce arguments
+  of the validated shape.
+- By hand against real images, not yet in the suite: the role split on
+  `postgres:17` (the app role cannot run programs or read server files) and
+  the restic restore command.
 
 ### Host faults
 

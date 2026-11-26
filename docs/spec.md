@@ -91,6 +91,9 @@ publish nothing; apps reach them over the app's Docker network.
 - The registry guard allows only what a push needs: the version check, blob
   and manifest existence checks, and uploads. Reading blobs or manifests,
   listing, deleting and cross-repository mounts are refused.
+- A blob belongs to the repositories that uploaded its bytes. Existence
+  checks and manifests see only the app's own blobs, so a manifest cannot
+  name content another app pushed, even when the digest is known.
 
 ## App definition
 
@@ -115,8 +118,12 @@ redis: { persistent: false }
 ```
 
 Unknown keys are an error. A definition that fails validation is reported by
-`zymple reload` and ignored; the previously loaded app keeps running and
-other apps are unaffected.
+`zymple reload` and ignored; the previously loaded app keeps running on its
+last good definition and other apps are unaffected. Its tokens file is still
+re-read, so a token can be revoked while the definition is broken. An app is
+removed, and its containers stopped, only when its directory is gone. A
+definition that claims a domain a kept app still serves loses: it is not
+loaded, or the app stays on its own previous definition.
 
 ### The compose subset
 
@@ -131,7 +138,14 @@ rejected.
   `pids_limit`, `volumes`.
 - Volumes are named volumes declared at the top level, with no options,
   mounted with the short `name:/path[:ro]` form. Host paths are not possible.
-- `user` may not be root.
+- `user` is `USER[:GROUP]`. USER is a decimal uid from 1 to 4294967295,
+  written without sign or leading zeros, or a lowercase account name other
+  than `root`. GROUP is a decimal gid or a lowercase group name. No other
+  spelling is accepted. Omitting `user` runs the image's own user.
+- Service names are reserved when Zymple uses them itself:
+  `<web service>-r<number>` always, `postgres` and `postgres-drill-*` when
+  the app declares Postgres, and `redis` when it declares Redis.
+- Mapping keys must be strings.
 - `$` is not allowed anywhere else, which disables compose interpolation.
 - YAML anchors, aliases and merge keys are refused.
 - `DATABASE_URL` and `REDIS_URL` may not be set by the app.
@@ -199,7 +213,10 @@ A release number is never reused, including by failed attempts.
 At startup and on `zymple reload`, each app is converged to its recorded
 state: web containers of releases that are not current are removed, the
 current one is started if stopped or recreated if missing, the proxy is
-pointed at it, and the other services are brought up. A crash before the
+pointed at it, and the other services are brought up. When the current
+release is already running, the proxy is pointed at it first, before
+anything is removed. One-off containers (`zymple run`, the release command)
+are never counted as the web container. A crash before the
 commit therefore converges back to the old release, and one after it
 converges forward.
 
@@ -211,7 +228,10 @@ takes effect without downtime; a reload alone does not restart containers.
 
 - Each successful deploy is a numbered release: digest, port, time, who.
 - The last `keep_releases` images are tagged `zymple/<app>:release-<n>`.
-  Older tags, and tags left by pushes, are removed after each deploy.
+  Older release tags are removed after each deploy. A tag left by a push is
+  removed at once when its image is a kept release, and otherwise an hour
+  after cleanup first saw it, so that an image another CI job has pushed but
+  not yet deployed is not taken away under it.
 - `zymple releases <app>` lists them.
 - `zymple rollback <app> [release]` runs the same sequence onto an image that
   is already on the host, skipping the `release` command. No transfer.
@@ -240,8 +260,21 @@ message. Do not run `prune -a` on a Zymple host; Zymple prunes its own images.
   `pitr_days`.
 - A deploy never restarts the Postgres container. It is recreated only when
   its image or settings change.
-- The app's role password is generated on first use and re-applied at every
-  start, so it survives a restore from another host.
+- The app connects as role `app`, which owns database `app` and is not a
+  superuser: it cannot run programs or read files in the database container,
+  where the backup credentials are. The cluster's superuser is `postgres`,
+  with its own generated password that no app is given. Only trusted
+  extensions can be created from the app; for anything else use
+  `docker exec -it zymple-<app>-postgres psql -U postgres app`.
+- Both passwords are generated on first use (`password` and `admin-password`
+  in the app's `postgres/` state directory). The roles and the app's password
+  are re-applied at every start, so they survive a restore from another host.
+- A cluster created before this split has `app` as its bootstrap superuser,
+  which Postgres does not allow to be demoted. Zymple adds the `postgres`
+  role, keeps the cluster working and logs a warning at every start. To get
+  the split, dump the database and restore it into a new cluster.
+- A database container that has to be replaced is stopped first, with up to
+  two minutes to shut down cleanly.
 - Without a backup repository, Postgres runs with archiving off.
 
 Operator commands, on the host:
@@ -266,7 +299,8 @@ A major version upgrade is a manual procedure in v1.
 
 - `persistent: false`: cache only, no volume, no backup.
 - `persistent: true`: AOF on a host directory, snapshotted daily to the
-  backup repository with restic. `zymple redis backup|restore <app>`.
+  backup repository with restic. `zymple redis backup|restore <app>`. Redis
+  is stopped for a restore and started again whether or not it succeeds.
 
 ## CLI summary
 
@@ -322,10 +356,17 @@ the operator with Ansible.
 
 Known limits:
 
-- The container content store is shared between apps. A token can learn
-  whether a blob with a given digest exists on the host. It cannot read it.
-- `docker inspect` on the host shows the Postgres password. Anyone who can
-  run docker there is already root-equivalent.
+- The container content store is shared between apps, but the registry
+  answers for a blob only to an app that uploaded it. The price is that each
+  app uploads a layer once, even when another app's image already has it.
+- There is no per-token upload quota. A token holder can fill the disk with
+  uploads; unreferenced uploads are collected after 24 hours. Limit request
+  sizes and source addresses in Caddy.
+- `docker inspect` on the host shows the Postgres superuser password. Anyone
+  who can run docker there is already root-equivalent. Secrets are never put
+  on a command line, where any local user could read them.
+- Long streams are bounded: past 10000 undelivered events the oldest are
+  dropped, and output with no line ending is cut into 64 KiB lines.
 
 ## Decisions made while building
 
@@ -354,6 +395,15 @@ Known limits:
   with a shared content store they would let one app fetch another's image.
 - **A caller's digest is never re-pinned by image id.** Restoring a lost
   image name is only done for digests from the app's own release history.
+- **Blob ownership is recorded by Zymple, not by the content store.** Each
+  committed upload labels the blob with the repository it was pushed to
+  (`zymple.io/pushed-to.<repository>`), after containerd has verified the
+  bytes against the digest. Images pushed before this existed carry no
+  label, so the first push after an upgrade uploads every layer again.
+  Releases already on the host are unaffected.
+- **Manifest lookups are bounded.** A lookup by digest answers only for the
+  app's own blobs of at most 4 MiB; anything larger is not a manifest and is
+  never read into memory.
 
 ## Open items
 
@@ -363,6 +413,7 @@ Known limits:
    directory repository. The generated pgBackRest and restic settings for S3
    are unit-tested only.
 3. **The systemd unit and the Ansible role have not run on a real host.**
+   The release workflow's provenance attestation has not run either.
 4. **Long release commands.** A migration longer than CI's job timeout still
    completes on the server; CI has to learn the result from `zymple status`.
 5. **Postgres major upgrades** are manual.

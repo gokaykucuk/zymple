@@ -24,13 +24,17 @@ import (
 )
 
 const (
-	labelConfig   = "zymple.config"
-	flagLabel     = "--label"
-	flagUser      = "--user"
-	envPGData     = "PGDATA="
-	rolePostgres  = "postgres"
-	roleRedis     = "redis"
-	pgUser        = "app"
+	labelConfig  = "zymple.config"
+	flagLabel    = "--label"
+	flagUser     = "--user"
+	envPGData    = "PGDATA="
+	rolePostgres = "postgres"
+	roleRedis    = "redis"
+	pgUser       = "app"
+	// pgAdmin is the cluster's superuser. The app's own role is an ordinary
+	// one: a superuser can run programs and read files inside the database
+	// container, which holds the backup repository's credentials.
+	pgAdmin       = "postgres"
 	pgDatabase    = "app"
 	pgDataMount   = "/var/lib/postgresql/data"
 	pgData        = pgDataMount + "/pgdata"
@@ -54,6 +58,15 @@ type Postgres struct {
 	// Sleep waits between readiness probes; replaced in tests.
 	Sleep func(ctx context.Context, d time.Duration)
 	Now   func() time.Time
+	// Warn receives conditions an operator should know about that do not
+	// fail the operation. Nil discards them.
+	Warn func(msg string)
+}
+
+func (p *Postgres) warn(msg string) {
+	if p.Warn != nil {
+		p.Warn(msg)
+	}
 }
 
 // PostgresContainer is the name of an app's Postgres container.
@@ -70,6 +83,13 @@ func (p *Postgres) backupsEnabled() bool { return p.Config.Backup != nil }
 // new password on the next deploy.
 func (p *Postgres) password(app string) (string, error) {
 	return secretFile(filepath.Join(p.dir(app), "password"))
+}
+
+// adminPassword returns the superuser's password. It is only ever given to
+// the image's first-run initialisation; Zymple itself connects over the
+// container's local socket, and the app never learns it.
+func (p *Postgres) adminPassword(app string) (string, error) {
+	return secretFile(filepath.Join(p.dir(app), "admin-password"))
 }
 
 func secretFile(path string) (string, error) {
@@ -111,7 +131,7 @@ func (p *Postgres) pgbackrestConf(app *appdef.App) string {
 	}
 	fmt.Fprintf(&s, "repo1-retention-full-type=time\nrepo1-retention-full=%d\n", app.Postgres.PITRDays)
 	s.WriteString("start-fast=y\nlog-level-console=info\nlog-level-file=off\n\n")
-	fmt.Fprintf(&s, "[%s]\npg1-path=%s\npg1-user=%s\n", app.Name, pgData, pgUser)
+	fmt.Fprintf(&s, "[%s]\npg1-path=%s\npg1-user=%s\n", app.Name, pgData, pgAdmin)
 	return s.String()
 }
 
@@ -160,6 +180,10 @@ func (p *Postgres) Ensure(ctx context.Context, app *appdef.App) (string, error) 
 	if err != nil {
 		return "", err
 	}
+	adminPW, err := p.adminPassword(app.Name)
+	if err != nil {
+		return "", err
+	}
 	image := p.Config.PostgresImage(app.Postgres.Version)
 	archive := p.backupsEnabled()
 	conf := ""
@@ -179,10 +203,8 @@ func (p *Postgres) Ensure(ctx context.Context, app *appdef.App) (string, error) 
 			return "", err
 		}
 	}
-	if state != "" {
-		if _, err := execx.Output(ctx, p.Runner, "docker", "rm", "-f", name); err != nil {
-			return "", err
-		}
+	if err := replace(ctx, p.Runner, name, state, postgresStopSeconds); err != nil {
+		return "", err
 	}
 	dataDir := filepath.Join(p.dir(app.Name), "data")
 	if err := mountPoint(dataDir); err != nil {
@@ -193,12 +215,14 @@ func (p *Postgres) Ensure(ctx context.Context, app *appdef.App) (string, error) 
 		flagLabel, appdef.LabelApp + "=" + app.Name, flagLabel, appdef.LabelRole + "=" + rolePostgres,
 		flagLabel, labelConfig + "=" + want,
 		"--shm-size", "256m",
-		"-e", "POSTGRES_USER=" + pgUser, "-e", "POSTGRES_DB=" + pgDatabase,
-		"-e", "POSTGRES_PASSWORD=" + pw, "-e", envPGData + pgData}
+		// Read only when the image initialises an empty data directory. The
+		// password has no value here: Docker takes it from its environment.
+		"-e", "POSTGRES_USER=" + pgAdmin, "-e", "POSTGRES_DB=" + pgDatabase,
+		"-e", "POSTGRES_PASSWORD", "-e", envPGData + pgData}
 	args = append(args, p.mounts(app.Name, dataDir)...)
 	args = append(args, image)
 	args = append(args, server...)
-	if _, err := execx.Output(ctx, p.Runner, "docker", args...); err != nil {
+	if _, err := dockerOutput(ctx, p.Runner, secretEnv("POSTGRES_PASSWORD="+adminPW), nil, args...); err != nil {
 		return "", err
 	}
 	if err := p.afterStart(ctx, app, name, pw); err != nil {
@@ -224,16 +248,13 @@ func (p *Postgres) writeConf(ctx context.Context, app *appdef.App, image, conf s
 	return err
 }
 
-// afterStart waits for the server, re-applies the role password and makes
-// sure the backup stanza exists.
+// afterStart waits for the server, makes sure its roles are as Zymple wants
+// them, and makes sure the backup stanza exists.
 func (p *Postgres) afterStart(ctx context.Context, app *appdef.App, name, pw string) error {
 	if err := p.waitReady(ctx, name); err != nil {
 		return err
 	}
-	// The password is hex, so it cannot break out of the SQL literal.
-	sql := fmt.Sprintf("ALTER ROLE %s PASSWORD '%s'", pgUser, pw)
-	if _, err := execx.Output(ctx, p.Runner, "docker", "exec", name,
-		"psql", "-U", pgUser, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-qc", sql); err != nil {
+	if err := p.ensureRoles(ctx, app.Name, name, pw); err != nil {
 		return err
 	}
 	if !p.backupsEnabled() {
@@ -241,6 +262,49 @@ func (p *Postgres) afterStart(ctx context.Context, app *appdef.App, name, pw str
 	}
 	_, err := execx.Output(ctx, p.Runner, "docker", p.backrest(app.Name, "stanza-create")...)
 	return err
+}
+
+// psql runs SQL in a cluster as the given role, over the container's local
+// socket, which the image trusts. The SQL travels on stdin: it can hold a
+// password, and a command line is readable by every local user.
+func (p *Postgres) psql(ctx context.Context, name, role, sql string) (string, error) {
+	return dockerOutput(ctx, p.Runner, nil, strings.NewReader(sql), "exec", "-i", name,
+		"psql", "-U", role, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-qAt", "-f", "-")
+}
+
+// ensureRoles brings a cluster's roles to the wanted shape, whatever created
+// it: a superuser named postgres for Zymple and pgBackRest, and the app's own
+// role, which owns the app's database and has the generated password. The
+// password is re-applied at every start, so it survives a restore from
+// another host. Every statement is safe to repeat.
+func (p *Postgres) ensureRoles(ctx context.Context, app, name, pw string) error {
+	if _, err := p.psql(ctx, name, pgAdmin, "SELECT 1"); err != nil {
+		// Clusters created before Zymple separated the two roles were
+		// initialised with the app's role as their only superuser.
+		create := fmt.Sprintf("CREATE ROLE %s SUPERUSER LOGIN", pgAdmin)
+		if _, legacyErr := p.psql(ctx, name, pgUser, create); legacyErr != nil {
+			return fmt.Errorf("no superuser to manage the cluster with: %w", errors.Join(err, legacyErr))
+		}
+	}
+	// The password is hex, so it cannot break out of the SQL literal.
+	sql := fmt.Sprintf(`DO $do$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '%[1]s') THEN CREATE ROLE %[1]s LOGIN; END IF;
+END $do$;
+ALTER ROLE %[1]s LOGIN PASSWORD '%[2]s';
+ALTER DATABASE %[3]s OWNER TO %[1]s;
+SELECT rolsuper FROM pg_roles WHERE rolname = '%[1]s';
+`, pgUser, pw, pgDatabase)
+	super, err := p.psql(ctx, name, pgAdmin, sql)
+	if err != nil {
+		return err
+	}
+	if super == "t" {
+		// The role that initialised a cluster cannot lose superuser.
+		p.warn(fmt.Sprintf("app %s: the database role %q is a superuser because this cluster predates the split between "+
+			"the app's role and the superuser; the app can read the backup credentials inside the database container. "+
+			"Dump and restore into a new cluster to fix this.", app, pgUser))
+	}
+	return nil
 }
 
 // mountPoint creates the host directory mounted at the image's data path.
@@ -414,7 +478,7 @@ func (p *Postgres) Restore(ctx context.Context, app *appdef.App, opts RestoreOpt
 		if err := mountPoint(dataDir); err != nil {
 			return err
 		}
-	} else if _, err := execx.Output(ctx, p.Runner, "docker", "stop", name); err != nil {
+	} else if _, err := execx.Output(ctx, p.Runner, "docker", "stop", "--time", postgresStopSeconds, name); err != nil {
 		return err
 	}
 

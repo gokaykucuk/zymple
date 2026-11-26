@@ -13,4 +13,6 @@ FuzzParse ./internal/appdef
 FuzzParse ./internal/auth
 FuzzAuthorize ./internal/registry
 FuzzValidDigest ./internal/deploy
+FuzzManifestPut ./internal/registry/containerdstore
+FuzzRestoreOptions ./internal/services
 TARGETS

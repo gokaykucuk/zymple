@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gokaykucuk/zymple/internal/runtime"
 )
 
 var ctx = context.Background()
@@ -177,7 +179,8 @@ func TestFailureAfterTheSwitchDoesNotFailTheDeploy(t *testing.T) {
 			if _, err := e.Deploy(ctx, app, digestA, "ci", nil); err != nil {
 				t.Fatal(err)
 			}
-			w.tags["push-leftover"] = true
+			// The tag this deploy's own push left behind.
+			w.tags["push-leftover"] = digestB
 			w.fail[op] = errInjected
 			var ev events
 			rel, err := e.Deploy(ctx, app, digestB, "ci", ev.sink)
@@ -397,7 +400,10 @@ func TestPruneKeepsTheNewestReleases(t *testing.T) {
 	w := newWorld()
 	e := newEngine(t, w)
 	app := testApp(t, "keep_releases: 2\n")
-	w.tags["push-abc123"] = true
+	// Left by the push of the last deploy below; its image ends up kept.
+	w.tags["push-abc123"] = digestA
+	// A release tag of a release that is not kept, however it got there.
+	w.tags["release-99"] = digestC
 	for _, d := range []string{digestA, digestB, digestC, digestA} {
 		if _, err := e.Deploy(ctx, app, d, "ci", nil); err != nil {
 			t.Fatal(err)
@@ -407,7 +413,7 @@ func TestPruneKeepsTheNewestReleases(t *testing.T) {
 	if len(st.Releases) != 2 || st.Releases[0].Number != 3 || st.Releases[1].Number != 4 {
 		t.Fatalf("kept releases = %+v, want 3 and 4", st.Releases)
 	}
-	if len(w.tags) != 2 || !w.tags["release-3"] || !w.tags["release-4"] {
+	if len(w.tags) != 2 || !w.hasTag("release-3") || !w.hasTag("release-4") {
 		t.Errorf("tags = %v, want release-3 and release-4 only", w.tags)
 	}
 	if w.compose[1] || w.compose[2] || !w.compose[3] || !w.compose[4] {
@@ -522,6 +528,48 @@ func TestReconcile(t *testing.T) {
 			t.Errorf("a healthy current release was restarted: %v", w.log)
 		}
 	})
+	// Regression: the uncommitted container used to be removed first, and
+	// the proxy stayed on its port while the app's database was started.
+	t.Run("traffic moves back before the uncommitted container is removed", func(t *testing.T) {
+		w := newWorld()
+		e := newEngine(t, w)
+		mustDeploy(t, e, w, digestA)
+		w.webs[2] = true
+		w.port = 29999
+		w.resetLog()
+		if err := e.Reconcile(ctx, app); err != nil {
+			t.Fatal(err)
+		}
+		sw, rm, env := w.indexOf("Switch 20001"), w.indexOf("RemoveWeb 2"), w.indexOf("Env")
+		if sw < 0 || rm < 0 || env < 0 || sw > rm || sw > env {
+			t.Errorf("want Switch 20001 before RemoveWeb 2 and Env, got %v", w.log)
+		}
+	})
+	t.Run("a failed switch back removes nothing", func(t *testing.T) {
+		w := newWorld()
+		e := newEngine(t, w)
+		mustDeploy(t, e, w, digestA)
+		w.webs[2] = true
+		w.port = 29999
+		w.fail["Switch"] = errInjected
+		if err := e.Reconcile(ctx, app); !errors.Is(err, errInjected) {
+			t.Fatalf("error = %v", err)
+		}
+		if w.calls("RemoveWeb") != 0 || len(w.runningWebs()) != 2 {
+			t.Errorf("the container traffic may still be on was removed: %v", w.log)
+		}
+		if e.Busy("shop") {
+			t.Error("lock not released")
+		}
+	})
+	t.Run("several containers of one stale release are removed once", func(t *testing.T) {
+		ws := classifyWebs([]runtime.Container{
+			{ID: "a", Release: 2, Running: true}, {ID: "b", Release: 2}, {ID: "c", Release: 1}, {ID: "d", Release: 1, Running: true},
+		}, 1)
+		if len(ws.stale) != 1 || ws.stale[0] != 2 || len(ws.stopped) != 1 || ws.stopped[0] != "c" || !ws.found || !ws.running {
+			t.Errorf("classifyWebs = %+v", ws)
+		}
+	})
 	t.Run("crash after the commit converges forward", func(t *testing.T) {
 		w := newWorld()
 		e := newEngine(t, w)
@@ -624,4 +672,85 @@ func FuzzValidDigest(f *testing.F) {
 			t.Fatalf("accepted %q", s)
 		}
 	})
+}
+
+// Regression: cleanup removed every tag that was not a kept release tag,
+// including the tag of an image another CI job had just pushed and was about
+// to deploy. That deploy then failed with an unknown digest.
+func TestCleanupLeavesAPendingPushAlone(t *testing.T) {
+	w := newWorld()
+	e := newEngine(t, w)
+	now := time.Unix(1_700_000_000, 0)
+	e.Now = func() time.Time { return now }
+	app := testApp(t, "")
+	const pending = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	w.tags["push-own"] = digestA     // this deploy's own push
+	w.tags["push-pending"] = pending // another job's push, not deployed yet
+	w.tags["push-nodigest"] = ""     // docker reported no digest
+	if _, err := e.Deploy(ctx, app, digestA, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	if w.hasTag("push-own") {
+		t.Error("the deploy's own push tag should go at once: the release tag protects the image")
+	}
+	if !w.hasTag("push-pending") || !w.hasTag("push-nodigest") {
+		t.Fatalf("a tag cleanup cannot account for was removed immediately: %v", w.tags)
+	}
+
+	// Still inside the grace period.
+	now = now.Add(pushTagGrace - time.Minute)
+	if _, err := e.Deploy(ctx, app, digestB, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !w.hasTag("push-pending") {
+		t.Fatal("the pending push was removed before the grace period ended")
+	}
+
+	// The other job deploys: its tag is now redundant and goes at once.
+	w.images[pending] = true
+	if _, err := e.Deploy(ctx, app, pending, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	if w.hasTag("push-pending") {
+		t.Error("a deployed push tag was kept")
+	}
+
+	// An abandoned push is removed once it has been seen for the grace period.
+	now = now.Add(2 * time.Minute)
+	if _, err := e.Deploy(ctx, app, digestA, "ci", nil); err != nil {
+		t.Fatal(err)
+	}
+	if w.hasTag("push-nodigest") {
+		t.Error("an abandoned tag outlived the grace period")
+	}
+	if left := e.tagSeen["shop"]; len(left) != 0 {
+		t.Errorf("first-seen times of removed tags were kept: %v", left)
+	}
+}
+
+func TestLogWriterBoundsALineWithoutNewline(t *testing.T) {
+	var ev events
+	w := &logWriter{sink: ev.sink, step: "release", release: 3}
+	chunk := strings.Repeat("x", 10<<10)
+	for i := 0; i < 20; i++ { // 200 KiB and never a newline
+		if n, err := w.Write([]byte(chunk)); n != len(chunk) || err != nil {
+			t.Fatalf("Write = %d, %v", n, err)
+		}
+		if w.buf.Len() >= maxLogLine {
+			t.Fatalf("buffer holds %d bytes after write %d", w.buf.Len(), i)
+		}
+	}
+	if len(ev.list) != 3 {
+		t.Fatalf("events = %d, want 3 full lines", len(ev.list))
+	}
+	for _, e := range ev.list {
+		if len(e.Message) != maxLogLine || e.Step != "release" || e.Release != 3 {
+			t.Errorf("event = %s/%d with %d bytes", e.Step, e.Release, len(e.Message))
+		}
+	}
+	// Ordinary lines still split on the newline, with "\r" trimmed.
+	_, _ = w.Write([]byte("\nnext\r\n"))
+	if got := ev.list[len(ev.list)-1].Message; got != "next" {
+		t.Errorf("last line = %q", got)
+	}
 }
