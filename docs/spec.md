@@ -181,7 +181,7 @@ Server side, per deploy:
 | release | Run `release` in a one-off container | Abort, old release untouched |
 | start | Start the new web container | Abort, remove it |
 | health | Poll the health check until `health_timeout` | Abort, remove it |
-| switch | Rewrite the Caddy snippet, graceful reload | Abort, restore the snippet |
+| switch | Atomically replace the app's port file, which Caddy reads on every request | Abort |
 | | **Commit**: record the release as current | Switch back, abort |
 | drain | Wait `drain`, stop the old web container | Report, continue |
 | services | Recreate the other compose services on the new image | Report, continue |
@@ -206,6 +206,18 @@ converges forward.
 `zymple redeploy <app>` starts a new release of the current image through the
 same blue/green sequence. This is how a changed `env` file or app definition
 takes effect without downtime; a reload alone does not restart containers.
+
+### How traffic is switched
+
+Each app has two files in `/etc/caddy/zymple/`: `<app>.caddy`, a site block
+with the app's domains, and `<app>.port`, the loopback port of the live
+release. The site block reads the port file on every request, so a switch is
+one atomic rename and Caddy is not reloaded.
+
+Caddy is reloaded only when the site block itself changes: on an app's first
+deploy, when its domains change, and when the app is removed. A reload makes
+Caddy replace its listening sockets, and a connection that arrives in that
+instant can be dropped, so domain changes are best made outside peak hours.
 
 ## Releases and rollback
 
@@ -347,6 +359,11 @@ Known limits:
 - **Caddy runs as a host package** and web containers publish on loopback
   ports, which stay stable across container restarts. Zymple needs no access
   to Caddy beyond one directory and a reload command.
+- **A deploy does not reload Caddy.** The first version rewrote the site
+  block and reloaded Caddy on every switch. Under load on CI runners about
+  one request in 100,000 then failed with a closed connection, always at the
+  moment of a reload. Reading the port from a file removed the reload, and
+  the same stress run then lost none of 1.05 million requests.
 - **Each release's web service has its own compose service name**
   (`web-r<n>`) inside one compose project, so old and new run side by side
   while sharing the project's named volumes.

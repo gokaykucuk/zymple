@@ -164,6 +164,7 @@ Omit `--time` to restore to the latest archived state.
 
 - **Do not run `docker image prune -a` or `docker system prune -a`.** They
   delete the images rollback needs. Zymple removes old images itself.
-- Do not edit `/etc/caddy/zymple/*.caddy` or anything under
-  `/var/lib/zymple`. Both are overwritten.
+- Do not edit anything in `/etc/caddy/zymple/` or under `/var/lib/zymple`.
+  Both are overwritten, and the `.port` files there decide where live
+  traffic goes.
 - Do not give anyone docker access on the host who should not be root.
