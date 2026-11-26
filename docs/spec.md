@@ -304,6 +304,11 @@ message. Do not run `prune -a` on a Zymple host; Zymple prunes its own images.
   with its own generated password that no app is given. Only trusted
   extensions can be created from the app; for anything else use
   `docker exec -it zymple-<app>-postgres psql -U postgres app`.
+- `postgres: { create_roles: true }` lets the app's role create other roles,
+  for apps whose migrations separate privileges that way. It is never a
+  superuser. The setting needs Postgres 16 or newer: before that, a role with
+  CREATEROLE could grant itself the predefined roles that read files and run
+  programs on the server. Removing the setting takes the privilege away.
 - Both passwords are generated on first use (`password` and `admin-password`
   in the app's `postgres/` state directory). The roles and the app's password
   are re-applied at every container start and once after each start of the

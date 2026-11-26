@@ -353,6 +353,14 @@ func TestPostgresPointInTimeRecovery(t *testing.T) {
 		return sql(container, "select coalesce(string_agg(note, ',' order by id), '') from t")
 	}
 
+	// The app asked to create roles: it can, and it is still not a superuser.
+	if got := sql(pg, "create role ledger_auditor nologin; select rolcreaterole::text || rolsuper::text from pg_roles where rolname = current_user"); got != "truefalse" {
+		t.Fatalf("createrole/superuser of the app's role = %q, want truefalse", got)
+	}
+	if out, err := hostOutput("docker", "exec", pg, "psql", "-U", "app", "-d", "app", "-qAt", "-c", "copy (select 1) to program 'true'"); err == nil {
+		t.Fatalf("the app's role can run programs on the database server: %s", out)
+	}
+
 	sql(pg, "create table t(id int primary key, note text)")
 	sql(pg, "insert into t values (1, 'before')")
 	mustHost(t, "zymple", "pg", "backup", a.name, "--type", "full")

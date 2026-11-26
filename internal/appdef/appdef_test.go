@@ -658,3 +658,24 @@ func TestServiceEnvNames(t *testing.T) {
 		}
 	}
 }
+
+func TestPostgresCreateRoles(t *testing.T) {
+	compose := "services:\n  web:\n    image: ${IMAGE}\n"
+	base := "name: shop\ndomains: [shop.example.com]\nweb: { service: web, port: 80 }\n"
+	app, err := Parse([]byte(base+"postgres: { version: 18, create_roles: true }\n"), []byte(compose))
+	if err != nil || !app.Postgres.CreateRoles {
+		t.Fatalf("create_roles on Postgres 18: %+v, %v", app, err)
+	}
+	if app, _ := Parse([]byte(base+"postgres: { version: 18 }\n"), []byte(compose)); app.Postgres.CreateRoles {
+		t.Error("create_roles must be off unless asked for")
+	}
+	// Before 16, CREATEROLE can grant itself file and program access.
+	for _, version := range []string{"14", "15"} {
+		if _, err := Parse([]byte(base+"postgres: { version: "+version+", create_roles: true }\n"), []byte(compose)); err == nil {
+			t.Errorf("create_roles accepted on Postgres %s", version)
+		}
+	}
+	if _, err := Parse([]byte(base+"postgres: { version: 16, create_roles: true }\n"), []byte(compose)); err != nil {
+		t.Errorf("create_roles refused on Postgres 16: %v", err)
+	}
+}

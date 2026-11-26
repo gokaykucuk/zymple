@@ -73,6 +73,10 @@ type Postgres struct {
 	// Env is the variable the connection URL is injected as. Apps that read
 	// their own name for it set this instead of renaming it in compose.
 	Env string `yaml:"env"`
+	// CreateRoles lets the app's database role create other roles, for apps
+	// whose migrations separate privileges that way. It never makes the role
+	// a superuser.
+	CreateRoles bool `yaml:"create_roles"`
 }
 
 // Redis declares a managed Redis instance.
@@ -286,6 +290,12 @@ func (p *Postgres) validate() error {
 	}
 	if !envNameRe.MatchString(p.Env) {
 		return fmt.Errorf("postgres.env %q must match %s", p.Env, envNameRe)
+	}
+	// Before Postgres 16 a role with CREATEROLE can grant itself the
+	// predefined roles that read files and run programs on the server,
+	// which is the access the app's role is denied on purpose.
+	if p.CreateRoles && p.Version < 16 {
+		return errors.New("postgres.create_roles needs postgres.version 16 or newer")
 	}
 	return nil
 }
