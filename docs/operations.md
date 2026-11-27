@@ -144,7 +144,7 @@ has published one, build the Dockerfile on the host and point
 `postgres_images` in `zymple.yml` at the result:
 
 ```yaml
-postgres_images: { 17: zymple-postgres:17 }
+postgres_images: { 18: zymple-postgres:18 }
 ```
 
 ## Database backup and restore
