@@ -9,7 +9,7 @@
 # ca-certificates is not optional: the official image has no certificate
 # authorities, and without them no TLS connection to an S3 endpoint is
 # trusted, so no backup or WAL segment reaches a bucket.
-ARG PG_MAJOR=17
+ARG PG_MAJOR=18
 FROM postgres:${PG_MAJOR}
 ARG WALG_VERSION=v3.0.10
 ARG WALG_SHA256_AMD64=ef16ca5fc079feab65c79cfdb75d80ce0d84622a3ab25b1fd2c8a3b9f1e0d9e5

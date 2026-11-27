@@ -26,7 +26,7 @@ import (
 const (
 	hostImage     = "zymple-e2e-host"
 	hostName      = "zymple-e2e"
-	postgresImage = "zymple-postgres:17"
+	postgresImage = "zymple-postgres:18"
 )
 
 var (
@@ -122,7 +122,7 @@ backup:
   path: /var/lib/zymple-backups
   cipher_pass: e2e-backup-passphrase
 postgres_images:
-  17: ` + postgresImage + "\n",
+  18: ` + postgresImage + "\n",
 		"/etc/caddy/Caddyfile": "{\n\tauto_https off\n}\n:80 {\n\treverse_proxy 127.0.0.1:7080\n}\nimport /etc/caddy/zymple/*.caddy\n",
 	}
 	for path, content := range files {
@@ -270,7 +270,7 @@ func newApp(t *testing.T, name string, o appOptions) app {
 		yml += fmt.Sprintf("keep_releases: %d\n", o.keep)
 	}
 	if o.postgres {
-		yml += "postgres: { version: 17, pitr_days: 7, env: LEDGER_DATABASE_URL, create_roles: true }\n"
+		yml += "postgres: { version: 18, pitr_days: 7, env: LEDGER_DATABASE_URL, create_roles: true }\n"
 	}
 	if o.redis {
 		yml += "redis: { persistent: false }\n"
